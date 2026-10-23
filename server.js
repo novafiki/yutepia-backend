@@ -246,7 +246,6 @@ app.post('/avatar', upload.single('avatar'), async (req, res) => {
       .eq('user_id', userId)
       .maybeSingle();
 
-    // Eski profil resmini R2'den sil (yer kaplamasın)
     if (oldData && oldData.avatar_key) {
       await s3.send(new DeleteObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
@@ -303,6 +302,44 @@ app.post('/theme', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Tema kaydetme hatası: ' + err.message });
   }
+});
+
+// ==========================================
+// 8. O ANKİ KULLANICININ SIRALI (1, 2, 3) ID'SİNİ BULMA
+// ==========================================
+app.get('/my-profile-id', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Gerekli' });
+
+  const { data, error } = await supabase.from('profiles').select('id').eq('user_id', userId).single();
+  if (error || !data) return res.status(404).json({ error: 'Profil ID bulunamadı' });
+  
+  res.json({ profileId: data.id });
+});
+
+// ==========================================
+// 9. ZİYARET EDİLEN PROFİLİN (Örn: /user/1) VERİLERİNİ GETİR
+// ==========================================
+app.get('/user-profile/:id', async (req, res) => {
+  const shortId = req.params.id; 
+  
+  // 1 numaranın gerçek Supabase UUID'sini bul
+  const { data: profile, error: profErr } = await supabase.from('profiles').select('user_id').eq('id', shortId).single();
+  if (profErr || !profile) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+
+  const realUserId = profile.user_id;
+
+  // O kullanıcıya ait tüm ayarları ve müzikleri çekip ziyaretçiye gönder
+  const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
+  const { data: songs } = await supabase.from('songs').select('id, title, url').eq('user_id', realUserId);
+
+  res.json({
+    avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff',
+    bgUrl: settings?.bg_url || './arkaplan.jpg',
+    panelColor: settings?.panel_color || '#73c8fa',
+    panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48,
+    songs: songs || []
+  });
 });
 
 const PORT = process.env.PORT || 3000;
