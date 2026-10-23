@@ -9,13 +9,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Maksimum tek dosya boyutu: 50 MB
+// Maksimum dosya boyutu: 50 MB
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-const MAX_USER_QUOTA_BYTES = 50 * 1024 * 1024; // Kullanıcı başı 50 MB limit
+const MAX_USER_QUOTA_BYTES = 50 * 1024 * 1024; // 50 MB müzik kotası
 
 // 1. Supabase Bağlantısı
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -30,7 +30,6 @@ const s3 = new S3Client({
   }
 });
 
-// Türkçe karakter ve boşluk temizleyici yardımcı fonksiyon
 function cleanFileName(name) {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
@@ -40,9 +39,7 @@ function cleanFileName(name) {
 // ==========================================
 app.get('/songs', async (req, res) => {
   const { userId } = req.query;
-  if (!userId) {
-    return res.status(400).json({ error: 'Kullanıcı ID gerekli.' });
-  }
+  if (!userId) return res.status(400).json({ error: 'Kullanıcı ID gerekli.' });
 
   const { data, error } = await supabase
     .from('songs')
@@ -70,7 +67,6 @@ app.post('/upload', upload.single('music'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Dosya bulunamadı.' });
 
   try {
-    // Kullanıcının mevcut kullandığı alanı hesapla
     const { data: existingSongs, error: fetchErr } = await supabase
       .from('songs')
       .select('file_size')
@@ -87,7 +83,6 @@ app.post('/upload', upload.single('music'), async (req, res) => {
 
     const fileKey = `music/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
 
-    // Cloudflare R2'ye yükle
     await s3.send(new PutObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
       Key: fileKey,
@@ -97,7 +92,6 @@ app.post('/upload', upload.single('music'), async (req, res) => {
 
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
 
-    // Supabase veritabanına kaydet
     const { data, error } = await supabase.from('songs').insert([
       {
         title: req.file.originalname,
@@ -110,10 +104,7 @@ app.post('/upload', upload.single('music'), async (req, res) => {
 
     if (error) throw error;
 
-    res.json({
-      message: 'Şarkı başarıyla yüklendi!',
-      song: data[0]
-    });
+    res.json({ message: 'Şarkı başarıyla yüklendi!', song: data[0] });
   } catch (err) {
     res.status(500).json({ error: 'Yükleme hatası: ' + err.message });
   }
@@ -129,7 +120,6 @@ app.delete('/songs/:id', async (req, res) => {
   if (!userId) return res.status(401).json({ error: 'Yetkisiz işlem.' });
 
   try {
-    // Şarkıyı bul ve sahibini doğrula
     const { data: song, error: findErr } = await supabase
       .from('songs')
       .select('*')
@@ -141,7 +131,6 @@ app.delete('/songs/:id', async (req, res) => {
       return res.status(404).json({ error: 'Şarkı bulunamadı veya silme yetkiniz yok.' });
     }
 
-    // Cloudflare R2'den dosyayı sil (Yer kaplamaması için)
     if (song.file_key) {
       await s3.send(new DeleteObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
@@ -149,7 +138,6 @@ app.delete('/songs/:id', async (req, res) => {
       }));
     }
 
-    // Supabase'den kaydı sil
     const { error: delErr } = await supabase
       .from('songs')
       .delete()
@@ -165,45 +153,59 @@ app.delete('/songs/:id', async (req, res) => {
 });
 
 // ==========================================
-// 4. KULLANICIYA ÖZEL ARKA PLAN GETİR VE YÜKLE
+// 4. KULLANICI PROFİL VE TEMA AYARLARINI GETİR
 // ==========================================
-app.get('/background', async (req, res) => {
+app.get('/profile-settings', async (req, res) => {
   const { userId } = req.query;
-  if (!userId) return res.json({ bgUrl: null });
+  if (!userId) return res.json({});
 
   const { data, error } = await supabase
     .from('user_backgrounds')
-    .select('bg_url')
+    .select('bg_url, avatar_url, panel_color, panel_opacity')
     .eq('user_id', userId)
     .maybeSingle();
 
-  if (error || !data) return res.json({ bgUrl: null });
-  res.json({ bgUrl: data.bg_url });
+  if (error || !data) {
+    return res.json({
+      bgUrl: null,
+      avatarUrl: null,
+      panelColor: '#73c8fa',
+      panelOpacity: 0.48
+    });
+  }
+
+  res.json({
+    bgUrl: data.bg_url || null,
+    avatarUrl: data.avatar_url || null,
+    panelColor: data.panel_color || '#73c8fa',
+    panelOpacity: data.panel_opacity !== null ? data.panel_opacity : 0.48
+  });
 });
 
+// ==========================================
+// 5. DUVAR KAĞIDI (WALLPAPER) YÜKLE
+// ==========================================
 app.post('/background', upload.single('background'), async (req, res) => {
   const userId = req.body.userId;
   if (!userId) return res.status(401).json({ error: 'Önce giriş yapmalısınız.' });
   if (!req.file) return res.status(400).json({ error: 'Resim dosyası seçilmedi.' });
 
   try {
-    // Eski arka plan varsa R2'den sil (yer kaplamasın)
-    const { data: oldBg } = await supabase
+    const { data: oldData } = await supabase
       .from('user_backgrounds')
       .select('file_key')
       .eq('user_id', userId)
       .maybeSingle();
 
-    if (oldBg && oldBg.file_key) {
+    if (oldData && oldData.file_key) {
       await s3.send(new DeleteObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
-        Key: oldBg.file_key
+        Key: oldData.file_key
       })).catch(() => {});
     }
 
     const fileKey = `backgrounds/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
 
-    // Yeni arka planı R2'ye yükle
     await s3.send(new PutObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
       Key: fileKey,
@@ -213,7 +215,6 @@ app.post('/background', upload.single('background'), async (req, res) => {
 
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
 
-    // Veritabanına kaydet (Upsert)
     const { error: upsertErr } = await supabase
       .from('user_backgrounds')
       .upsert({
@@ -227,6 +228,80 @@ app.post('/background', upload.single('background'), async (req, res) => {
     res.json({ message: 'Arka plan kaydedildi!', bgUrl: publicUrl });
   } catch (err) {
     res.status(500).json({ error: 'Arka plan yükleme hatası: ' + err.message });
+  }
+});
+
+// ==========================================
+// 6. PROFİL RESMİ (AVATAR) YÜKLE
+// ==========================================
+app.post('/avatar', upload.single('avatar'), async (req, res) => {
+  const userId = req.body.userId;
+  if (!userId) return res.status(401).json({ error: 'Önce giriş yapmalısınız.' });
+  if (!req.file) return res.status(400).json({ error: 'Resim dosyası seçilmedi.' });
+
+  try {
+    const { data: oldData } = await supabase
+      .from('user_backgrounds')
+      .select('avatar_key')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    // Eski profil resmini R2'den sil (yer kaplamasın)
+    if (oldData && oldData.avatar_key) {
+      await s3.send(new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: oldData.avatar_key
+      })).catch(() => {});
+    }
+
+    const avatarKey = `avatars/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
+
+    await s3.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: avatarKey,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+
+    const publicUrl = `${process.env.R2_PUBLIC_URL}/${avatarKey}`;
+
+    const { error: upsertErr } = await supabase
+      .from('user_backgrounds')
+      .upsert({
+        user_id: userId,
+        avatar_url: publicUrl,
+        avatar_key: avatarKey
+      }, { onConflict: 'user_id' });
+
+    if (upsertErr) throw upsertErr;
+
+    res.json({ message: 'Profil resmi güncellendi!', avatarUrl: publicUrl });
+  } catch (err) {
+    res.status(500).json({ error: 'Profil resmi yükleme hatası: ' + err.message });
+  }
+});
+
+// ==========================================
+// 7. PANEL RENGİ VE OPAKLIĞINI KAYDET
+// ==========================================
+app.post('/theme', async (req, res) => {
+  const { userId, panelColor, panelOpacity } = req.body;
+  if (!userId) return res.status(401).json({ error: 'Önce giriş yapmalısınız.' });
+
+  try {
+    const { error } = await supabase
+      .from('user_backgrounds')
+      .upsert({
+        user_id: userId,
+        panel_color: panelColor || '#73c8fa',
+        panel_opacity: Number(panelOpacity)
+      }, { onConflict: 'user_id' });
+
+    if (error) throw error;
+
+    res.json({ message: 'Tema ayarları hesabına kaydedildi!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Tema kaydetme hatası: ' + err.message });
   }
 });
 
