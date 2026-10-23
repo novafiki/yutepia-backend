@@ -108,11 +108,11 @@ app.get('/user-profile/:id', async (req, res) => {
   const realUserId = profile.user_id;
   const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
   const { data: songs } = await supabase.from('songs').select('id, title, url').eq('user_id', realUserId);
-  res.json({ realUserId, displayName: profile.display_name, avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff', bgUrl: settings?.bg_url || './arkaplan.jpg', panelColor: settings?.panel_color || '#73c8fa', panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48, songs: songs || [] });
+  res.json({ realUserId, displayName: profile.display_name, avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff', bgUrl: settings?.bg_url || '/arkaplan.jpg', panelColor: settings?.panel_color || '#73c8fa', panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48, songs: songs || [] });
 });
 
 // ==========================================
-// YENİ: ARKADAŞLIK VE AKTİFLİK SİSTEMİ
+// ARKADAŞLIK VE AKTİFLİK SİSTEMİ (HATALAR DÜZELTİLDİ)
 // ==========================================
 app.post('/ping', async (req, res) => {
     const { userId, displayName } = req.body; if(!userId) return res.json({success:false});
@@ -130,33 +130,57 @@ app.get('/online-users', async (req, res) => {
     res.json(result);
 });
 
+// İSTEK GÖNDERME - GÜVENLİ SORGULAR KULLANILDI
 app.post('/friends/request', async (req, res) => {
     const { senderId, receiverId } = req.body;
-    if(senderId === receiverId) return res.status(400).json({error:'Kendinize istek gönderemezsiniz.'});
-    const {data: existing} = await supabase.from('friendships').select('*').or(`and(sender_id.eq.${senderId},receiver_id.eq.${receiverId}),and(sender_id.eq.${receiverId},receiver_id.eq.${senderId})`);
-    if(existing && existing.length > 0) return res.status(400).json({error:'Zaten bir istek veya arkadaşlık mevcut.'});
-    await supabase.from('friendships').insert({sender_id: senderId, receiver_id: receiverId});
-    res.json({success:true});
+    if(!senderId || !receiverId) return res.status(400).json({error: 'Eksik bilgi.'});
+    if(senderId === receiverId) return res.status(400).json({error: 'Kendinize istek gönderemezsiniz.'});
+    
+    // Zaten ekli mi veya istek var mı kontrolü
+    const { data: ex1 } = await supabase.from('friendships').select('id').eq('sender_id', senderId).eq('receiver_id', receiverId);
+    const { data: ex2 } = await supabase.from('friendships').select('id').eq('sender_id', receiverId).eq('receiver_id', senderId);
+    
+    if ((ex1 && ex1.length > 0) || (ex2 && ex2.length > 0)) {
+        return res.status(400).json({error: 'Zaten bir istek veya arkadaşlık mevcut.'});
+    }
+    
+    // Veritabanına isteği zorunlu 'pending' durumuyla ekle (Çökmeyi engeller)
+    const { error } = await supabase.from('friendships').insert({
+        sender_id: senderId, 
+        receiver_id: receiverId, 
+        status: 'pending'
+    });
+    
+    if (error) return res.status(500).json({error: 'Veritabanı kaydı başarısız.'});
+    res.json({success: true});
 });
 
 app.get('/friends/requests/:userId', async (req, res) => {
     const { userId } = req.params;
-    const { data } = await supabase.from('friendships').select('id, sender_id').eq('receiver_id', userId).eq('status', 'pending');
-    if(!data || data.length === 0) return res.json([]);
+    const { data, error } = await supabase.from('friendships').select('id, sender_id').eq('receiver_id', userId).eq('status', 'pending');
+    if(error || !data || data.length === 0) return res.json([]);
+    
     const senderIds = data.map(d => d.sender_id);
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name').in('user_id', senderIds);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', senderIds);
+    
     const result = data.map(req => {
         const prof = profiles?.find(p => p.user_id === req.sender_id);
         const bg = bgs?.find(b => b.user_id === req.sender_id);
-        return { id: req.id, sender_id: req.sender_id, display_name: prof?.display_name || 'Gizemli Üye', avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof?.display_name}&backgroundColor=72c7ff` };
+        return { 
+            id: req.id, 
+            sender_id: req.sender_id, 
+            display_name: prof?.display_name || 'Gizemli Üye', 
+            avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff` 
+        };
     });
     res.json(result);
 });
 
 app.post('/friends/respond', async (req, res) => {
     const { requestId, status } = req.body; 
-    await supabase.from('friendships').update({status}).eq('id', requestId);
+    const { error } = await supabase.from('friendships').update({status}).eq('id', requestId);
+    if(error) return res.status(500).json({error: error.message});
     res.json({success: true});
 });
 
