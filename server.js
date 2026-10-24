@@ -130,30 +130,39 @@ app.get('/online-users', async (req, res) => {
     res.json(result);
 });
 
-// İSTEK GÖNDERME - HATA MESAJI DOĞRUDAN DÖNDÜRÜLDÜ
+// İSTEK GÖNDERME - GÜVENLİ SORGULAR VE REDDEDİLENLERİ TEMİZLEME
 app.post('/friends/request', async (req, res) => {
     const { senderId, receiverId } = req.body;
     if(!senderId || !receiverId) return res.status(400).json({error: 'Eksik bilgi.'});
     if(senderId === receiverId) return res.status(400).json({error: 'Kendinize istek gönderemezsiniz.'});
     
-    const { data: ex1 } = await supabase.from('friendships').select('id').eq('sender_id', senderId).eq('receiver_id', receiverId);
-    const { data: ex2 } = await supabase.from('friendships').select('id').eq('sender_id', receiverId).eq('receiver_id', senderId);
+    // Geçmişte atılmış bir istek veya arkadaşlık var mı kontrol et
+    const { data: ex1 } = await supabase.from('friendships').select('id, status').eq('sender_id', senderId).eq('receiver_id', receiverId);
+    const { data: ex2 } = await supabase.from('friendships').select('id, status').eq('sender_id', receiverId).eq('receiver_id', senderId);
     
-    if ((ex1 && ex1.length > 0) || (ex2 && ex2.length > 0)) {
-        return res.status(400).json({error: 'Zaten bir istek veya arkadaşlık mevcut.'});
+    const record = (ex1 && ex1.length > 0) ? ex1[0] : ((ex2 && ex2.length > 0) ? ex2[0] : null);
+    
+    if (record) {
+        if (record.status === 'pending') {
+            return res.status(400).json({error: 'Zaten bekleyen bir istek var.'});
+        }
+        if (record.status === 'accepted') {
+            return res.status(400).json({error: 'Zaten arkadaşsınız.'});
+        }
+        if (record.status === 'rejected') {
+            // Eğer önceden reddedildiyse, o eski kaydı tamamen sil ki yenisini atabilelim
+            await supabase.from('friendships').delete().eq('id', record.id);
+        }
     }
     
+    // Yepyeni arkadaşlık isteğini oluştur
     const { error } = await supabase.from('friendships').insert({
         sender_id: senderId, 
         receiver_id: receiverId, 
         status: 'pending'
     });
     
-    // Hata varsa SAKLAMA, direkt olarak kullanıcının ekranına bas
-    if (error) {
-        return res.status(500).json({error: `DB Hatası: ${error.message}`});
-    }
-    
+    if (error) return res.status(500).json({error: `DB Hatası: ${error.message}`});
     res.json({success: true});
 });
 
@@ -179,10 +188,19 @@ app.get('/friends/requests/:userId', async (req, res) => {
     res.json(result);
 });
 
+// İSTEĞE CEVAP VERME (Kabul veya Red)
 app.post('/friends/respond', async (req, res) => {
     const { requestId, status } = req.body; 
-    const { error } = await supabase.from('friendships').update({status}).eq('id', requestId);
-    if(error) return res.status(500).json({error: error.message});
+    
+    if (status === 'rejected') {
+        // Red tuşuna basıldıysa veritabanından tamamen SİL
+        const { error } = await supabase.from('friendships').delete().eq('id', requestId);
+        if(error) return res.status(500).json({error: error.message});
+    } else {
+        // Kabul tuşuna basıldıysa durumu 'accepted' olarak GÜNCELLE
+        const { error } = await supabase.from('friendships').update({status}).eq('id', requestId);
+        if(error) return res.status(500).json({error: error.message});
+    }
     res.json({success: true});
 });
 
