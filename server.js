@@ -120,9 +120,18 @@ app.post('/ping', async (req, res) => {
     res.json({success:true});
 });
 
+// YENİ: ÇIKIŞ YAPILDIĞINDA ANINDA OFFLINE OLMAK İÇİN SİNYAL
+app.post('/logout', async (req, res) => {
+    const { userId } = req.body; if(!userId) return res.json({success:false});
+    const pastDate = new Date(Date.now() - 10 * 60000).toISOString();
+    await supabase.from('profiles').update({ last_seen: pastDate }).eq('user_id', userId);
+    res.json({success:true});
+});
+
 app.get('/online-users', async (req, res) => {
-    const fiveMinsAgo = new Date(Date.now() - 5 * 60000).toISOString();
-    const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id').gte('last_seen', fiveMinsAgo);
+    // 5 Dakika değil, artık 2 DAKİKA kuralı geçerli (Hemen offline düşer)
+    const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
+    const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id').gte('last_seen', twoMinsAgo);
     if(!profiles || profiles.length === 0) return res.json([]);
     const userIds = profiles.map(p => p.user_id);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', userIds);
@@ -130,38 +139,22 @@ app.get('/online-users', async (req, res) => {
     res.json(result);
 });
 
-// İSTEK GÖNDERME - GÜVENLİ SORGULAR VE REDDEDİLENLERİ TEMİZLEME
 app.post('/friends/request', async (req, res) => {
     const { senderId, receiverId } = req.body;
     if(!senderId || !receiverId) return res.status(400).json({error: 'Eksik bilgi.'});
     if(senderId === receiverId) return res.status(400).json({error: 'Kendinize istek gönderemezsiniz.'});
     
-    // Geçmişte atılmış bir istek veya arkadaşlık var mı kontrol et
     const { data: ex1 } = await supabase.from('friendships').select('id, status').eq('sender_id', senderId).eq('receiver_id', receiverId);
     const { data: ex2 } = await supabase.from('friendships').select('id, status').eq('sender_id', receiverId).eq('receiver_id', senderId);
-    
     const record = (ex1 && ex1.length > 0) ? ex1[0] : ((ex2 && ex2.length > 0) ? ex2[0] : null);
     
     if (record) {
-        if (record.status === 'pending') {
-            return res.status(400).json({error: 'Zaten bekleyen bir istek var.'});
-        }
-        if (record.status === 'accepted') {
-            return res.status(400).json({error: 'Zaten arkadaşsınız.'});
-        }
-        if (record.status === 'rejected') {
-            // Eğer önceden reddedildiyse, o eski kaydı tamamen sil ki yenisini atabilelim
-            await supabase.from('friendships').delete().eq('id', record.id);
-        }
+        if (record.status === 'pending') return res.status(400).json({error: 'Zaten bekleyen bir istek var.'});
+        if (record.status === 'accepted') return res.status(400).json({error: 'Zaten arkadaşsınız.'});
+        if (record.status === 'rejected') await supabase.from('friendships').delete().eq('id', record.id);
     }
     
-    // Yepyeni arkadaşlık isteğini oluştur
-    const { error } = await supabase.from('friendships').insert({
-        sender_id: senderId, 
-        receiver_id: receiverId, 
-        status: 'pending'
-    });
-    
+    const { error } = await supabase.from('friendships').insert({ sender_id: senderId, receiver_id: receiverId, status: 'pending' });
     if (error) return res.status(500).json({error: `DB Hatası: ${error.message}`});
     res.json({success: true});
 });
@@ -179,25 +172,19 @@ app.get('/friends/requests/:userId', async (req, res) => {
         const prof = profiles?.find(p => p.user_id === req.sender_id);
         const bg = bgs?.find(b => b.user_id === req.sender_id);
         return { 
-            id: req.id, 
-            sender_id: req.sender_id, 
-            display_name: prof?.display_name || 'Gizemli Üye', 
+            id: req.id, sender_id: req.sender_id, display_name: prof?.display_name || 'Gizemli Üye', 
             avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff` 
         };
     });
     res.json(result);
 });
 
-// İSTEĞE CEVAP VERME (Kabul veya Red)
 app.post('/friends/respond', async (req, res) => {
     const { requestId, status } = req.body; 
-    
     if (status === 'rejected') {
-        // Red tuşuna basıldıysa veritabanından tamamen SİL
         const { error } = await supabase.from('friendships').delete().eq('id', requestId);
         if(error) return res.status(500).json({error: error.message});
     } else {
-        // Kabul tuşuna basıldıysa durumu 'accepted' olarak GÜNCELLE
         const { error } = await supabase.from('friendships').update({status}).eq('id', requestId);
         if(error) return res.status(500).json({error: error.message});
     }
@@ -211,13 +198,15 @@ app.get('/friends/:userId', async (req, res) => {
     const friendIds = data.map(d => d.sender_id === userId ? d.receiver_id : d.sender_id);
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds);
-    const fiveMinsAgo = new Date(Date.now() - 5 * 60000).toISOString();
+    
+    // Arkadaşlarda da süreyi 2 dakikaya çektik
+    const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
     
     const result = friendIds.map(fid => {
         const prof = profiles?.find(p => p.user_id === fid);
         const bg = bgs?.find(b => b.user_id === fid);
         if(!prof) return null;
-        return { user_id: fid, profile_id: prof.id, display_name: prof.display_name || 'Üye', avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`, is_online: prof.last_seen > fiveMinsAgo };
+        return { user_id: fid, profile_id: prof.id, display_name: prof.display_name || 'Üye', avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`, is_online: prof.last_seen > twoMinsAgo };
     }).filter(Boolean);
     res.json(result);
 });
