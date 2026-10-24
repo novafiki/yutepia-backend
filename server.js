@@ -112,7 +112,7 @@ app.get('/user-profile/:id', async (req, res) => {
 });
 
 // ==========================================
-// ARKADAŞLIK VE AKTİFLİK SİSTEMİ (HATALAR DÜZELTİLDİ)
+// ARKADAŞLIK VE AKTİFLİK SİSTEMİ
 // ==========================================
 app.post('/ping', async (req, res) => {
     const { userId, displayName } = req.body; if(!userId) return res.json({success:false});
@@ -130,13 +130,12 @@ app.get('/online-users', async (req, res) => {
     res.json(result);
 });
 
-// İSTEK GÖNDERME - GÜVENLİ SORGULAR KULLANILDI
+// İSTEK GÖNDERME - HATA MESAJI DOĞRUDAN DÖNDÜRÜLDÜ
 app.post('/friends/request', async (req, res) => {
     const { senderId, receiverId } = req.body;
     if(!senderId || !receiverId) return res.status(400).json({error: 'Eksik bilgi.'});
     if(senderId === receiverId) return res.status(400).json({error: 'Kendinize istek gönderemezsiniz.'});
     
-    // Zaten ekli mi veya istek var mı kontrolü
     const { data: ex1 } = await supabase.from('friendships').select('id').eq('sender_id', senderId).eq('receiver_id', receiverId);
     const { data: ex2 } = await supabase.from('friendships').select('id').eq('sender_id', receiverId).eq('receiver_id', senderId);
     
@@ -144,14 +143,17 @@ app.post('/friends/request', async (req, res) => {
         return res.status(400).json({error: 'Zaten bir istek veya arkadaşlık mevcut.'});
     }
     
-    // Veritabanına isteği zorunlu 'pending' durumuyla ekle (Çökmeyi engeller)
     const { error } = await supabase.from('friendships').insert({
         sender_id: senderId, 
         receiver_id: receiverId, 
         status: 'pending'
     });
     
-    if (error) return res.status(500).json({error: 'Veritabanı kaydı başarısız.'});
+    // Hata varsa SAKLAMA, direkt olarak kullanıcının ekranına bas
+    if (error) {
+        return res.status(500).json({error: `DB Hatası: ${error.message}`});
+    }
+    
     res.json({success: true});
 });
 
