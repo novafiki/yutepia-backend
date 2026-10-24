@@ -101,14 +101,24 @@ app.get('/my-profile-id', async (req, res) => {
   res.json({ profileId: data.id });
 });
 
+// PROFİL VERİLERİ (Kayıt Tarihi 'created_at' Eklendi)
 app.get('/user-profile/:id', async (req, res) => {
   const shortId = req.params.id; 
-  const { data: profile } = await supabase.from('profiles').select('user_id, display_name').eq('id', shortId).single();
+  const { data: profile } = await supabase.from('profiles').select('user_id, display_name, created_at').eq('id', shortId).single();
   if (!profile) return res.status(404).json({ error: 'Bulunamadı' });
   const realUserId = profile.user_id;
   const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
   const { data: songs } = await supabase.from('songs').select('id, title, url').eq('user_id', realUserId);
-  res.json({ realUserId, displayName: profile.display_name, avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff', bgUrl: settings?.bg_url || '/arkaplan.jpg', panelColor: settings?.panel_color || '#73c8fa', panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48, songs: songs || [] });
+  res.json({
+    realUserId,
+    displayName: profile.display_name,
+    createdAt: profile.created_at,
+    avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff',
+    bgUrl: settings?.bg_url || '/arkaplan.jpg',
+    panelColor: settings?.panel_color || '#73c8fa',
+    panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48,
+    songs: songs || []
+  });
 });
 
 // ==========================================
@@ -120,7 +130,6 @@ app.post('/ping', async (req, res) => {
     res.json({success:true});
 });
 
-// YENİ: ÇIKIŞ YAPILDIĞINDA ANINDA OFFLINE OLMAK İÇİN SİNYAL
 app.post('/logout', async (req, res) => {
     const { userId } = req.body; if(!userId) return res.json({success:false});
     const pastDate = new Date(Date.now() - 10 * 60000).toISOString();
@@ -129,7 +138,6 @@ app.post('/logout', async (req, res) => {
 });
 
 app.get('/online-users', async (req, res) => {
-    // 5 Dakika değil, artık 2 DAKİKA kuralı geçerli (Hemen offline düşer)
     const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id').gte('last_seen', twoMinsAgo);
     if(!profiles || profiles.length === 0) return res.json([]);
@@ -199,7 +207,6 @@ app.get('/friends/:userId', async (req, res) => {
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds);
     
-    // Arkadaşlarda da süreyi 2 dakikaya çektik
     const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
     
     const result = friendIds.map(fid => {
