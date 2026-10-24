@@ -56,10 +56,55 @@ app.delete('/songs/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// KULLANICI PROFİL VE TEMA AYARLARI (Kullanıcı adı, bgOpacity ve bgBlur dahil)
 app.get('/profile-settings', async (req, res) => {
   const { userId } = req.query; if (!userId) return res.json({});
   const { data } = await supabase.from('user_backgrounds').select('*').eq('user_id', userId).maybeSingle();
-  res.json({ bgUrl: data?.bg_url || null, avatarUrl: data?.avatar_url || null, panelColor: data?.panel_color || '#73c8fa', panelOpacity: data?.panel_opacity !== null ? data?.panel_opacity : 0.48 });
+  const { data: prof } = await supabase.from('profiles').select('display_name, id').eq('user_id', userId).maybeSingle();
+  res.json({
+    displayName: prof?.display_name || null,
+    profileId: prof?.id || null,
+    bgUrl: data?.bg_url || null,
+    avatarUrl: data?.avatar_url || null,
+    panelColor: data?.panel_color || '#73c8fa',
+    panelOpacity: data?.panel_opacity !== null && data?.panel_opacity !== undefined ? Number(data.panel_opacity) : 0.48,
+    bgOpacity: data?.bg_opacity !== null && data?.bg_opacity !== undefined ? Number(data.bg_opacity) : 1.0,
+    bgBlur: data?.bg_blur !== null && data?.bg_blur !== undefined ? Number(data.bg_blur) : 0
+  });
+});
+
+// BENZERSİZ KULLANICI ADI GÜNCELLEME SİSTEMİ
+app.post('/username', async (req, res) => {
+  const { userId, username } = req.body;
+  if (!userId || !username) return res.status(400).json({ error: 'Kullanıcı adı boş olamaz.' });
+
+  const cleanName = username.trim();
+  if (cleanName.length < 3 || cleanName.length > 20) {
+    return res.status(400).json({ error: 'Kullanıcı adı 3 ile 20 karakter arasında olmalıdır.' });
+  }
+
+  try {
+    // Aynı kullanıcı adı başka bir hesap tarafından alınmış mı kontrol et (büyük/küçük harf duyarsız)
+    const { data: existing } = await supabase
+      .from('profiles')
+      .select('user_id, display_name')
+      .ilike('display_name', cleanName);
+
+    const isTaken = existing && existing.some(p => p.user_id !== userId && p.display_name.toLowerCase() === cleanName.toLowerCase());
+    if (isTaken) {
+      return res.status(400).json({ error: 'Bu kullanıcı adı zaten başkası tarafından alınmış!' });
+    }
+
+    const { error } = await supabase
+      .from('profiles')
+      .update({ display_name: cleanName })
+      .eq('user_id', userId);
+
+    if (error) throw error;
+    res.json({ success: true, displayName: cleanName });
+  } catch (err) {
+    res.status(500).json({ error: 'Kullanıcı adı güncellenemedi: ' + err.message });
+  }
 });
 
 app.post('/background', upload.single('background'), async (req, res) => {
@@ -88,35 +133,63 @@ app.post('/avatar', upload.single('avatar'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// TEMA, ARKA PLAN OPAKLIĞI VE BLUR KAYDETME
 app.post('/theme', async (req, res) => {
-  const { userId, panelColor, panelOpacity } = req.body; if (!userId) return res.status(401).json({ error: 'Yetkisiz' });
-  await supabase.from('user_backgrounds').upsert({ user_id: userId, panel_color: panelColor || '#73c8fa', panel_opacity: Number(panelOpacity) }, { onConflict: 'user_id' });
+  const { userId, panelColor, panelOpacity, bgOpacity, bgBlur } = req.body;
+  if (!userId) return res.status(401).json({ error: 'Yetkisiz' });
+
+  const updatePayload = {
+    user_id: userId,
+    panel_color: panelColor || '#73c8fa',
+    panel_opacity: panelOpacity !== undefined ? Number(panelOpacity) : 0.48,
+    bg_opacity: bgOpacity !== undefined ? Number(bgOpacity) : 1.0,
+    bg_blur: bgBlur !== undefined ? Number(bgBlur) : 0
+  };
+
+  const { error } = await supabase.from('user_backgrounds').upsert(updatePayload, { onConflict: 'user_id' });
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 app.get('/my-profile-id', async (req, res) => {
   const { userId } = req.query; if (!userId) return res.status(400).json({ error: 'Gerekli' });
-  const { data, error } = await supabase.from('profiles').select('id').eq('user_id', userId).single();
+  const { data, error } = await supabase.from('profiles').select('id, display_name').eq('user_id', userId).single();
   if (error || !data) return res.status(404).json({ error: 'Bulunamadı' });
-  res.json({ profileId: data.id });
+  res.json({ profileId: data.id, displayName: data.display_name });
 });
 
-// PROFİL VERİLERİ (Kayıt Tarihi 'created_at' Eklendi)
+// ZİYARET EDİLEN PROFİL VERİLERİ (Arkadaşlık durumu ve arka plan efektleri dahil)
 app.get('/user-profile/:id', async (req, res) => {
-  const shortId = req.params.id; 
+  const shortId = req.params.id;
+  const viewerId = req.query.viewerId;
+
   const { data: profile } = await supabase.from('profiles').select('user_id, display_name, created_at').eq('id', shortId).single();
   if (!profile) return res.status(404).json({ error: 'Bulunamadı' });
   const realUserId = profile.user_id;
   const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
-  const { data: songs } = await supabase.from('songs').select('id, title, url').eq('user_id', realUserId);
+  const { data: songs } = await supabase.from('songs').select('id, title, url, file_size').eq('user_id', realUserId).order('id', { ascending: true });
+
+  let friendshipStatus = 'none';
+  if (viewerId && viewerId !== realUserId) {
+    const { data: f1 } = await supabase.from('friendships').select('status').eq('sender_id', viewerId).eq('receiver_id', realUserId).maybeSingle();
+    const { data: f2 } = await supabase.from('friendships').select('status').eq('sender_id', realUserId).eq('receiver_id', viewerId).maybeSingle();
+    const rel = f1 || f2;
+    if (rel && rel.status) {
+      friendshipStatus = rel.status; // 'accepted', 'pending', 'rejected'
+    }
+  }
+
   res.json({
     realUserId,
     displayName: profile.display_name,
     createdAt: profile.created_at,
-    avatarUrl: settings?.avatar_url || 'https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff',
+    friendshipStatus,
+    avatarUrl: settings?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${profile.display_name || 'Anon'}&backgroundColor=72c7ff`,
     bgUrl: settings?.bg_url || '/arkaplan.jpg',
     panelColor: settings?.panel_color || '#73c8fa',
-    panelOpacity: settings?.panel_opacity !== undefined ? settings?.panel_opacity : 0.48,
+    panelOpacity: settings?.panel_opacity !== null && settings?.panel_opacity !== undefined ? Number(settings.panel_opacity) : 0.48,
+    bgOpacity: settings?.bg_opacity !== null && settings?.bg_opacity !== undefined ? Number(settings.bg_opacity) : 1.0,
+    bgBlur: settings?.bg_blur !== null && settings?.bg_blur !== undefined ? Number(settings.bg_blur) : 0,
     songs: songs || []
   });
 });
@@ -125,8 +198,17 @@ app.get('/user-profile/:id', async (req, res) => {
 // ARKADAŞLIK VE AKTİFLİK SİSTEMİ
 // ==========================================
 app.post('/ping', async (req, res) => {
-    const { userId, displayName } = req.body; if(!userId) return res.json({success:false});
-    await supabase.from('profiles').update({ last_seen: new Date().toISOString(), display_name: displayName }).eq('user_id', userId);
+    const { userId, defaultName } = req.body;
+    if(!userId) return res.json({success:false});
+
+    // Kullanıcının özel bir kullanıcı adı varsa onu ezme, sadece boşsa varsayılan ata
+    const { data: existingProf } = await supabase.from('profiles').select('display_name').eq('user_id', userId).maybeSingle();
+    const updateObj = { last_seen: new Date().toISOString() };
+    if (!existingProf?.display_name && defaultName) {
+        updateObj.display_name = defaultName;
+    }
+
+    await supabase.from('profiles').update(updateObj).eq('user_id', userId);
     res.json({success:true});
 });
 
