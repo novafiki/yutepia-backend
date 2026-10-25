@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const crypto = require('crypto');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
@@ -9,8 +10,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 55 * 1024 * 1024 } });
+const chatBgUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
 const MAX_USER_QUOTA_BYTES = 50 * 1024 * 1024;
+const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024; // 50 MB
+const MAX_CHAT_FILE_BYTES = 1024 * 1024 * 1024; // 1 GB
+const MAX_CHAT_BG_BYTES = 10 * 1024 * 1024; // 10 MB
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const s3 = new S3Client({
@@ -19,7 +25,102 @@ const s3 = new S3Client({
   credentials: { accessKeyId: process.env.R2_ACCESS_KEY, secretAccessKey: process.env.R2_SECRET_KEY }
 });
 
-function cleanFileName(name) { return name.replace(/[^a-zA-Z0-9._-]/g, '_'); }
+function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
+
+// 1 GB'A KADAR DOĞRUDAN R2 YÜKLEMESİ İÇİN AWS S3 V4 PRESIGNED URL ÜRETİCİ (Ek paket gerektirmez)
+function createR2PresignedPutUrl(fileKey, contentType, expiresInSeconds = 3600) {
+  const endpointUrl = new URL(process.env.R2_ENDPOINT);
+  const host = endpointUrl.host;
+  const bucket = process.env.R2_BUCKET_NAME;
+  const accessKey = process.env.R2_ACCESS_KEY;
+  const secretKey = process.env.R2_SECRET_KEY;
+  const region = 'auto';
+  const service = 's3';
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+
+  const encodedKey = fileKey.split('/').map( segment => encodeURIComponent(segment) ).join('/');
+  const canonicalUri = `/${bucket}/${encodedKey}`;
+
+  const queryParams = new URLSearchParams({
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${accessKey}/${credentialScope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresInSeconds),
+    'X-Amz-SignedHeaders': 'host'
+  });
+  queryParams.sort();
+  const canonicalQueryString = queryParams.toString();
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = 'host';
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+
+  const canonicalRequest = [
+    'PUT',
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join('\n');
+
+  const canonicalRequestHash = crypto.createHash('sha256').update(canonicalRequest, 'utf8').digest('hex');
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    canonicalRequestHash
+  ].join('\n');
+
+  const hmac = (key, data) => crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  const kSigning = hmac(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+
+  return `${endpointUrl.protocol}//${host}${canonicalUri}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
+}
+
+// SÜRESİ DOLAN (>50 MB VE 24 SAATİ GEÇMİŞ) DOSYALARI SUNUCUDAN OTOMATİK SİLME SİSTEMİ
+async function cleanupExpiredLargeFiles() {
+  try {
+    const nowIso = new Date().toISOString();
+    const { data: expiredMsgs } = await supabase
+      .from('messages')
+      .select('id, attachment_key, attachment_name')
+      .eq('is_large_file', true)
+      .eq('is_expired_deleted', false)
+      .lte('expires_at', nowIso);
+
+    if (expiredMsgs && expiredMsgs.length > 0) {
+      for (const msg of expiredMsgs) {
+        if (msg.attachment_key) {
+          await s3.send(new DeleteObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: msg.attachment_key
+          })).catch(() => {});
+        }
+        await supabase
+          .from('messages')
+          .update({
+            attachment_url: null,
+            attachment_key: null,
+            is_expired_deleted: true
+          })
+          .eq('id', msg.id);
+      }
+    }
+  } catch (err) {
+    console.error('Geçici dosya temizleme hatası:', err.message);
+  }
+}
+
+// Her 5 dakikada bir süresi dolan >50MB dosyaları otomatik temizle
+setInterval(cleanupExpiredLargeFiles, 5 * 60 * 1000);
 
 // MÜZİKLERİ GETİR (sort_order'a göre sıralı)
 app.get('/songs', async (req, res) => {
@@ -97,6 +198,7 @@ app.get('/profile-settings', async (req, res) => {
     displayName: prof?.display_name || null,
     profileId: prof?.id || null,
     bgUrl: data?.bg_url || null,
+    chatBgUrl: data?.chat_bg_url || null,
     avatarUrl: data?.avatar_url || null,
     panelColor: data?.panel_color || '#73c8fa',
     panelOpacity: data?.panel_opacity !== null && data?.panel_opacity !== undefined ? Number(data.panel_opacity) : 0.48,
@@ -298,7 +400,6 @@ app.post('/friends/request', async (req, res) => {
     res.json({success: true});
 });
 
-// ARKADAŞLIKTAN ÇIKARMA
 app.post('/friends/remove', async (req, res) => {
     const { userId, friendId } = req.body;
     if (!userId || !friendId) return res.status(400).json({ error: 'Eksik bilgi.' });
@@ -360,6 +461,262 @@ app.get('/friends/:userId', async (req, res) => {
         return { user_id: fid, profile_id: prof.id, display_name: prof.display_name || 'Üye', avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`, is_online: prof.last_seen > twoMinsAgo };
     }).filter(Boolean);
     res.json(result);
+});
+
+// ==========================================
+// SOHBET (CHAT) SİSTEMİ VE GEÇİCİ DOSYA YÖNETİMİ
+// ==========================================
+
+// Kullanıcının aktif >50MB dosyası var mı kontrol et
+async function checkActiveLargeFileLock(userId) {
+  await cleanupExpiredLargeFiles();
+  const nowIso = new Date().toISOString();
+  const { data: activeLarge } = await supabase
+    .from('messages')
+    .select('id, attachment_name, expires_at')
+    .eq('sender_id', userId)
+    .eq('is_large_file', true)
+    .eq('is_expired_deleted', false)
+    .gt('expires_at', nowIso)
+    .limit(1);
+
+  if (activeLarge && activeLarge.length > 0) {
+    const expDate = new Date(activeLarge[0].expires_at);
+    const diffMs = Math.max(0, expDate - new Date());
+    const hoursLeft = Math.floor(diffMs / (1000 * 60 * 60));
+    const minsLeft = Math.ceil((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    return {
+      locked: true,
+      fileName: activeLarge[0].attachment_name,
+      expiresAt: activeLarge[0].expires_at,
+      message: `50 MB üzerinde aktif bir dosyanız (${activeLarge[0].attachment_name}) zaten var! Silinmesine kalan süre: ${hoursLeft} saat ${minsLeft} dk.`
+    };
+  }
+  return { locked: false };
+}
+
+// 1. İki kullanıcı arasındaki mesajları getir
+app.get('/chat/messages', async (req, res) => {
+  const { user1, user2 } = req.query;
+  if (!user1 || !user2) return res.status(400).json({ error: 'Eksik bilgi.' });
+
+  await cleanupExpiredLargeFiles();
+
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .or(`and(sender_id.eq.${user1},receiver_id.eq.${user2}),and(sender_id.eq.${user2},receiver_id.eq.${user1})`)
+    .order('created_at', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// 2. Doğrudan R2'ye (1 GB'a kadar) dosya yüklemek için Presigned URL al
+app.post('/chat/presign-upload', async (req, res) => {
+  const { senderId, fileName, fileSize, contentType } = req.body;
+  if (!senderId || !fileName || !fileSize) return res.status(400).json({ error: 'Eksik dosya bilgisi.' });
+
+  const sizeNum = Number(fileSize);
+  if (sizeNum > MAX_CHAT_FILE_BYTES) {
+    return res.status(400).json({ error: 'Tek seferde gönderilebilecek maksimum dosya boyutu 1 GB olabilir!' });
+  }
+
+  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
+  if (isLargeFile) {
+    const lockStatus = await checkActiveLargeFileLock(senderId);
+    if (lockStatus.locked) {
+      return res.status(400).json({ error: lockStatus.message });
+    }
+  }
+
+  const fileKey = `chat/${senderId}/${Date.now()}-${cleanFileName(fileName)}`;
+  const uploadUrl = createR2PresignedPutUrl(fileKey, contentType || 'application/octet-stream', 3600);
+  const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
+  const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
+
+  res.json({
+    uploadUrl,
+    publicUrl,
+    fileKey,
+    isLargeFile,
+    expiresAt
+  });
+});
+
+// 3. Sunucu üzerinden dosya yükleme (50 MB altı dosyalar veya CORS yedeği için)
+app.post('/chat/upload-direct', upload.single('file'), async (req, res) => {
+  const { senderId } = req.body;
+  if (!senderId || !req.file) return res.status(400).json({ error: 'Dosya bulunamadı.' });
+
+  const sizeNum = req.file.size;
+  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
+  if (isLargeFile) {
+    const lockStatus = await checkActiveLargeFileLock(senderId);
+    if (lockStatus.locked) {
+      return res.status(400).json({ error: lockStatus.message });
+    }
+  }
+
+  try {
+    const fileKey = `chat/${senderId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
+    await s3.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: fileKey,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype || 'application/octet-stream'
+    }));
+    const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
+    const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
+
+    res.json({
+      publicUrl,
+      fileKey,
+      fileName: req.file.originalname,
+      fileSize: sizeNum,
+      isLargeFile,
+      expiresAt
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Sohbete mesaj / medya kaydı gönder
+app.post('/chat/send', async (req, res) => {
+  const {
+    senderId,
+    receiverId,
+    content,
+    attachmentUrl,
+    attachmentKey,
+    attachmentName,
+    attachmentType,
+    attachmentSize
+  } = req.body;
+
+  if (!senderId || !receiverId) return res.status(400).json({ error: 'Gönderici veya alıcı eksik.' });
+
+  const sizeNum = Number(attachmentSize) || 0;
+  if (sizeNum > MAX_CHAT_FILE_BYTES) {
+    return res.status(400).json({ error: 'Maksimum dosya boyutu 1 GB olabilir!' });
+  }
+
+  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
+  if (isLargeFile) {
+    const lockStatus = await checkActiveLargeFileLock(senderId);
+    if (lockStatus.locked) {
+      return res.status(400).json({ error: lockStatus.message });
+    }
+  }
+
+  const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
+
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert([{
+        sender_id: senderId,
+        receiver_id: receiverId,
+        content: content || '',
+        attachment_url: attachmentUrl || null,
+        attachment_key: attachmentKey || null,
+        attachment_name: attachmentName || null,
+        attachment_type: attachmentType || null,
+        attachment_size: sizeNum,
+        is_large_file: isLargeFile,
+        expires_at: expiresAt,
+        is_expired_deleted: false,
+        is_pinned: false
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, message: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Mesaj Sabitle / Sabitlemeyi Kaldır
+app.post('/chat/pin', async (req, res) => {
+  const { messageId, isPinned } = req.body;
+  if (!messageId) return res.status(400).json({ error: 'Mesaj ID gerekli.' });
+
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .update({ is_pinned: Boolean(isPinned) })
+      .eq('id', messageId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, message: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. Sohbet Arka Planı Yükle (Resim veya GIF - Maksimum 10 MB)
+app.post('/chat/background', (req, res) => {
+  chatBgUpload.single('chatBg')(req, res, async (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Sohbet arka planı maksimum 10 MB olabilir!' });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+
+    const userId = req.body.userId;
+    if (!userId || !req.file) return res.status(400).json({ error: 'Dosya seçilmedi.' });
+    if (req.file.size > MAX_CHAT_BG_BYTES) {
+      return res.status(400).json({ error: 'Sohbet arka planı maksimum 10 MB olabilir!' });
+    }
+
+    try {
+      const { data: oldData } = await supabase.from('user_backgrounds').select('chat_bg_key').eq('user_id', userId).maybeSingle();
+      if (oldData && oldData.chat_bg_key) {
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {});
+      }
+
+      const fileKey = `chat_backgrounds/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
+      await s3.send(new PutObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: fileKey,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype
+      }));
+      const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
+
+      await supabase.from('user_backgrounds').upsert({
+        user_id: userId,
+        chat_bg_url: publicUrl,
+        chat_bg_key: fileKey
+      }, { onConflict: 'user_id' });
+
+      res.json({ chatBgUrl: publicUrl });
+    } catch (uploadErr) {
+      res.status(500).json({ error: uploadErr.message });
+    }
+  });
+});
+
+// Sohbet arka planını sıfırla
+app.post('/chat/background/reset', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'Yetkisiz' });
+  try {
+    const { data: oldData } = await supabase.from('user_backgrounds').select('chat_bg_key').eq('user_id', userId).maybeSingle();
+    if (oldData && oldData.chat_bg_key) {
+      await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {});
+    }
+    await supabase.from('user_backgrounds').update({ chat_bg_url: null, chat_bg_key: null }).eq('user_id', userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
