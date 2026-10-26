@@ -27,7 +27,7 @@ const s3 = new S3Client({
 
 function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
 
-// 1 GB'A KADAR DOĞRUDAN R2 YÜKLEMESİ İÇİN AWS S3 V4 PRESIGNED URL ÜRETİCİ (Ek paket gerektirmez)
+// 1 GB'A KADAR DOĞRUDAN R2 YÜKLEMESİ İÇİN AWS S3 V4 PRESIGNED URL ÜRETİCİ
 function createR2PresignedPutUrl(fileKey, contentType, expiresInSeconds = 3600) {
   const endpointUrl = new URL(process.env.R2_ENDPOINT);
   const host = endpointUrl.host;
@@ -42,7 +42,7 @@ function createR2PresignedPutUrl(fileKey, contentType, expiresInSeconds = 3600) 
   const dateStamp = amzDate.slice(0, 8);
   const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
 
-  const encodedKey = fileKey.split('/').map( segment => encodeURIComponent(segment) ).join('/');
+  const encodedKey = fileKey.split('/').map(segment => encodeURIComponent(segment)).join('/');
   const canonicalUri = `/${bucket}/${encodedKey}`;
 
   const queryParams = new URLSearchParams({
@@ -119,10 +119,9 @@ async function cleanupExpiredLargeFiles() {
   }
 }
 
-// Her 5 dakikada bir süresi dolan >50MB dosyaları otomatik temizle
 setInterval(cleanupExpiredLargeFiles, 5 * 60 * 1000);
 
-// MÜZİKLERİ GETİR (sort_order'a göre sıralı)
+// MÜZİKLERİ GETİR
 app.get('/songs', async (req, res) => {
   const { userId } = req.query; if (!userId) return res.status(400).json({ error: 'Gerekli.' });
   const { data, error } = await supabase
@@ -444,6 +443,7 @@ app.post('/friends/respond', async (req, res) => {
     res.json({success: true});
 });
 
+// ARKADAŞ LİSTESİ (Son mesajlaşma zamanı ile birlikte döner)
 app.get('/friends/:userId', async (req, res) => {
     const { userId } = req.params;
     const { data } = await supabase.from('friendships').select('*').eq('status', 'accepted').or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
@@ -452,13 +452,37 @@ app.get('/friends/:userId', async (req, res) => {
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds);
     
+    // Kullanıcının mesajlarını çekip her arkadaşla olan en son mesaj tarihini bul
+    const { data: recentMsgs } = await supabase
+      .from('messages')
+      .select('sender_id, receiver_id, created_at')
+      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
+      .order('created_at', { ascending: false });
+
+    const lastMsgMap = {};
+    if (recentMsgs) {
+      for (const m of recentMsgs) {
+        const otherId = m.sender_id === userId ? m.receiver_id : m.sender_id;
+        if (!lastMsgMap[otherId]) {
+          lastMsgMap[otherId] = m.created_at;
+        }
+      }
+    }
+
     const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
     
     const result = friendIds.map(fid => {
         const prof = profiles?.find(p => p.user_id === fid);
         const bg = bgs?.find(b => b.user_id === fid);
         if(!prof) return null;
-        return { user_id: fid, profile_id: prof.id, display_name: prof.display_name || 'Üye', avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`, is_online: prof.last_seen > twoMinsAgo };
+        return {
+          user_id: fid,
+          profile_id: prof.id,
+          display_name: prof.display_name || 'Üye',
+          avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`,
+          is_online: prof.last_seen > twoMinsAgo,
+          last_message_at: lastMsgMap[fid] || null
+        };
     }).filter(Boolean);
     res.json(result);
 });
@@ -467,7 +491,40 @@ app.get('/friends/:userId', async (req, res) => {
 // SOHBET (CHAT) SİSTEMİ VE GEÇİCİ DOSYA YÖNETİMİ
 // ==========================================
 
-// Kullanıcının aktif >50MB dosyası var mı kontrol et
+// GIPHY ARAMA SERVİSİ
+app.get('/chat/gifs', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  const giphyKey = process.env.GIPHY_API_KEY || 'dc6zaTOxFJmzC'; // Giphy Public Key veya .env anahtarı
+  try {
+    const endpoint = q
+      ? `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=24&rating=pg-13`
+      : `https://api.giphy.com/v1/gifs/trending?api_key=${giphyKey}&limit=24&rating=pg-13`;
+
+    const response = await fetch(endpoint);
+    const json = await response.json();
+    if (json && Array.isArray(json.data) && json.data.length > 0) {
+      const urls = json.data.map(item =>
+        item.images?.fixed_height_small?.url ||
+        item.images?.fixed_height?.url ||
+        item.images?.downsized?.url ||
+        item.images?.original?.url
+      ).filter(Boolean);
+      return res.json({ gifs: urls });
+    }
+
+    // Yedek GIF arama servisi (Eğer genel anahtar yoğunluktan kısıtlanırsa devreye girer)
+    const tenorEndpoint = q
+      ? `https://g.tenor.com/v1/search?q=${encodeURIComponent(q)}&key=LIVDSRZULELA&limit=24`
+      : `https://g.tenor.com/v1/trending?key=LIVDSRZULELA&limit=24`;
+    const tRes = await fetch(tenorEndpoint);
+    const tJson = await tRes.json();
+    const tUrls = (tJson.results || []).map(item => item.media?.[0]?.tinygif?.url || item.media?.[0]?.gif?.url).filter(Boolean);
+    return res.json({ gifs: tUrls });
+  } catch (err) {
+    res.json({ gifs: [] });
+  }
+});
+
 async function checkActiveLargeFileLock(userId) {
   await cleanupExpiredLargeFiles();
   const nowIso = new Date().toISOString();
