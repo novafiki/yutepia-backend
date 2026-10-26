@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const crypto = require('crypto');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
@@ -10,12 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 55 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const chatBgUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const voiceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const MAX_USER_QUOTA_BYTES = 50 * 1024 * 1024;
-const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024; // 50 MB
-const MAX_CHAT_FILE_BYTES = 1024 * 1024 * 1024; // 1 GB
 const MAX_CHAT_BG_BYTES = 10 * 1024 * 1024; // 10 MB
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -26,100 +24,6 @@ const s3 = new S3Client({
 });
 
 function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
-
-// 1 GB'A KADAR DOĞRUDAN R2 YÜKLEMESİ İÇİN AWS S3 V4 PRESIGNED URL ÜRETİCİ
-function createR2PresignedPutUrl(fileKey, contentType, expiresInSeconds = 3600) {
-  const endpointUrl = new URL(process.env.R2_ENDPOINT);
-  const host = endpointUrl.host;
-  const bucket = process.env.R2_BUCKET_NAME;
-  const accessKey = process.env.R2_ACCESS_KEY;
-  const secretKey = process.env.R2_SECRET_KEY;
-  const region = 'auto';
-  const service = 's3';
-
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.slice(0, 8);
-  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-
-  const encodedKey = fileKey.split('/').map(segment => encodeURIComponent(segment)).join('/');
-  const canonicalUri = `/${bucket}/${encodedKey}`;
-
-  const queryParams = new URLSearchParams({
-    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
-    'X-Amz-Credential': `${accessKey}/${credentialScope}`,
-    'X-Amz-Date': amzDate,
-    'X-Amz-Expires': String(expiresInSeconds),
-    'X-Amz-SignedHeaders': 'host'
-  });
-  queryParams.sort();
-  const canonicalQueryString = queryParams.toString();
-  const canonicalHeaders = `host:${host}\n`;
-  const signedHeaders = 'host';
-  const payloadHash = 'UNSIGNED-PAYLOAD';
-
-  const canonicalRequest = [
-    'PUT',
-    canonicalUri,
-    canonicalQueryString,
-    canonicalHeaders,
-    signedHeaders,
-    payloadHash
-  ].join('\n');
-
-  const canonicalRequestHash = crypto.createHash('sha256').update(canonicalRequest, 'utf8').digest('hex');
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    canonicalRequestHash
-  ].join('\n');
-
-  const hmac = (key, data) => crypto.createHmac('sha256', key).update(data, 'utf8').digest();
-  const kDate = hmac(`AWS4${secretKey}`, dateStamp);
-  const kRegion = hmac(kDate, region);
-  const kService = hmac(kRegion, service);
-  const kSigning = hmac(kService, 'aws4_request');
-  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
-
-  return `${endpointUrl.protocol}//${host}${canonicalUri}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
-}
-
-// SÜRESİ DOLAN (>50 MB VE 24 SAATİ GEÇMİŞ) DOSYALARI SUNUCUDAN OTOMATİK SİLME SİSTEMİ
-async function cleanupExpiredLargeFiles() {
-  try {
-    const nowIso = new Date().toISOString();
-    const { data: expiredMsgs } = await supabase
-      .from('messages')
-      .select('id, attachment_key, attachment_name')
-      .eq('is_large_file', true)
-      .eq('is_expired_deleted', false)
-      .lte('expires_at', nowIso);
-
-    if (expiredMsgs && expiredMsgs.length > 0) {
-      for (const msg of expiredMsgs) {
-        if (msg.attachment_key) {
-          await s3.send(new DeleteObjectCommand({
-            Bucket: process.env.R2_BUCKET_NAME,
-            Key: msg.attachment_key
-          })).catch(() => {});
-        }
-        await supabase
-          .from('messages')
-          .update({
-            attachment_url: null,
-            attachment_key: null,
-            is_expired_deleted: true
-          })
-          .eq('id', msg.id);
-      }
-    }
-  } catch (err) {
-    console.error('Geçici dosya temizleme hatası:', err.message);
-  }
-}
-
-setInterval(cleanupExpiredLargeFiles, 5 * 60 * 1000);
 
 // MÜZİKLERİ GETİR
 app.get('/songs', async (req, res) => {
@@ -192,10 +96,11 @@ app.delete('/songs/:id', async (req, res) => {
 app.get('/profile-settings', async (req, res) => {
   const { userId } = req.query; if (!userId) return res.json({});
   const { data } = await supabase.from('user_backgrounds').select('*').eq('user_id', userId).maybeSingle();
-  const { data: prof } = await supabase.from('profiles').select('display_name, id').eq('user_id', userId).maybeSingle();
+  const { data: prof } = await supabase.from('profiles').select('display_name, id, bio').eq('user_id', userId).maybeSingle();
   res.json({
     displayName: prof?.display_name || null,
     profileId: prof?.id || null,
+    bio: prof?.bio || '',
     bgUrl: data?.bg_url || null,
     chatBgUrl: data?.chat_bg_url || null,
     avatarUrl: data?.avatar_url || null,
@@ -205,6 +110,23 @@ app.get('/profile-settings', async (req, res) => {
     bgBlur: data?.bg_blur !== null && data?.bg_blur !== undefined ? Number(data.bg_blur) : 0,
     autoPlay: data?.auto_play === true
   });
+});
+
+// HAKKINDA (BIO) GÜNCELLEME
+app.post('/profile/bio', async (req, res) => {
+  const { userId, bio } = req.body;
+  if (!userId) return res.status(400).json({ error: 'Yetkisiz işlem.' });
+  const cleanBio = (bio || '').trim().slice(0, 300);
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ bio: cleanBio || 'Henüz bir hakkında yazısı eklenmemiş.' })
+      .eq('user_id', userId);
+    if (error) throw error;
+    res.json({ success: true, bio: cleanBio || 'Henüz bir hakkında yazısı eklenmemiş.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // BENZERSİZ KULLANICI ADI GÜNCELLEME
@@ -295,12 +217,12 @@ app.get('/my-profile-id', async (req, res) => {
   res.json({ profileId: data.id, displayName: data.display_name });
 });
 
-// ZİYARET EDİLEN PROFİL VERİLERİ
+// ZİYARET EDİLEN PROFİL VERİLERİ (Hakkında / Bio ile birlikte)
 app.get('/user-profile/:id', async (req, res) => {
   const shortId = req.params.id;
   const viewerId = req.query.viewerId;
 
-  const { data: profile } = await supabase.from('profiles').select('user_id, display_name, created_at').eq('id', shortId).single();
+  const { data: profile } = await supabase.from('profiles').select('user_id, display_name, created_at, bio').eq('id', shortId).single();
   if (!profile) return res.status(404).json({ error: 'Bulunamadı' });
   const realUserId = profile.user_id;
   const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
@@ -332,6 +254,7 @@ app.get('/user-profile/:id', async (req, res) => {
     realUserId,
     displayName: profile.display_name,
     createdAt: profile.created_at,
+    bio: profile.bio || 'Henüz bir hakkında yazısı eklenmemiş.',
     friendshipStatus,
     viewerAutoPlay,
     ownerAutoPlay: settings?.auto_play === true,
@@ -443,7 +366,7 @@ app.post('/friends/respond', async (req, res) => {
     res.json({success: true});
 });
 
-// ARKADAŞ LİSTESİ (Son mesajlaşma zamanı ile birlikte döner)
+// ARKADAŞ LİSTESİ (Son mesajlaşma zamanı ve okunmamış mesaj sayısıyla birlikte)
 app.get('/friends/:userId', async (req, res) => {
     const { userId } = req.params;
     const { data } = await supabase.from('friendships').select('*').eq('status', 'accepted').or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
@@ -452,19 +375,23 @@ app.get('/friends/:userId', async (req, res) => {
     const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds);
     const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds);
     
-    // Kullanıcının mesajlarını çekip her arkadaşla olan en son mesaj tarihini bul
     const { data: recentMsgs } = await supabase
       .from('messages')
-      .select('sender_id, receiver_id, created_at')
+      .select('sender_id, receiver_id, created_at, is_read')
+      .is('group_id', null)
       .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
       .order('created_at', { ascending: false });
 
     const lastMsgMap = {};
+    const unreadFromMap = {};
     if (recentMsgs) {
       for (const m of recentMsgs) {
         const otherId = m.sender_id === userId ? m.receiver_id : m.sender_id;
-        if (!lastMsgMap[otherId]) {
+        if (otherId && !lastMsgMap[otherId]) {
           lastMsgMap[otherId] = m.created_at;
+        }
+        if (m.receiver_id === userId && m.is_read === false) {
+          unreadFromMap[m.sender_id] = (unreadFromMap[m.sender_id] || 0) + 1;
         }
       }
     }
@@ -481,87 +408,139 @@ app.get('/friends/:userId', async (req, res) => {
           display_name: prof.display_name || 'Üye',
           avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`,
           is_online: prof.last_seen > twoMinsAgo,
-          last_message_at: lastMsgMap[fid] || null
+          last_message_at: lastMsgMap[fid] || null,
+          unread_count: unreadFromMap[fid] || 0
         };
     }).filter(Boolean);
     res.json(result);
 });
 
 // ==========================================
-// SOHBET (CHAT) SİSTEMİ VE GEÇİCİ DOSYA YÖNETİMİ
+// SOHBET (CHAT), GRUP SOHBETİ VE SESLİ MESAJ SİSTEMİ
 // ==========================================
 
-// GIPHY ARAMA SERVİSİ
-app.get('/chat/gifs', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  const giphyKey = process.env.GIPHY_API_KEY || 'dc6zaTOxFJmzC'; // Giphy Public Key veya .env anahtarı
+// OKUNMAMIŞ MESAJ SAYISI (Chat butonu kırmızı bildirim yuvarlağı için)
+app.get('/chat/unread/:userId', async (req, res) => {
+  const { userId } = req.params;
+  if (!userId) return res.json({ unreadCount: 0 });
   try {
-    const endpoint = q
-      ? `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=24&rating=pg-13`
-      : `https://api.giphy.com/v1/gifs/trending?api_key=${giphyKey}&limit=24&rating=pg-13`;
-
-    const response = await fetch(endpoint);
-    const json = await response.json();
-    if (json && Array.isArray(json.data) && json.data.length > 0) {
-      const urls = json.data.map(item =>
-        item.images?.fixed_height_small?.url ||
-        item.images?.fixed_height?.url ||
-        item.images?.downsized?.url ||
-        item.images?.original?.url
-      ).filter(Boolean);
-      return res.json({ gifs: urls });
-    }
-
-    // Yedek GIF arama servisi (Eğer genel anahtar yoğunluktan kısıtlanırsa devreye girer)
-    const tenorEndpoint = q
-      ? `https://g.tenor.com/v1/search?q=${encodeURIComponent(q)}&key=LIVDSRZULELA&limit=24`
-      : `https://g.tenor.com/v1/trending?key=LIVDSRZULELA&limit=24`;
-    const tRes = await fetch(tenorEndpoint);
-    const tJson = await tRes.json();
-    const tUrls = (tJson.results || []).map(item => item.media?.[0]?.tinygif?.url || item.media?.[0]?.gif?.url).filter(Boolean);
-    return res.json({ gifs: tUrls });
+    const { count } = await supabase
+      .from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('receiver_id', userId)
+      .eq('is_read', false);
+    res.json({ unreadCount: count || 0 });
   } catch (err) {
-    res.json({ gifs: [] });
+    res.json({ unreadCount: 0 });
   }
 });
 
-async function checkActiveLargeFileLock(userId) {
-  await cleanupExpiredLargeFiles();
-  const nowIso = new Date().toISOString();
-  const { data: activeLarge } = await supabase
-    .from('messages')
-    .select('id, attachment_name, expires_at')
-    .eq('sender_id', userId)
-    .eq('is_large_file', true)
-    .eq('is_expired_deleted', false)
-    .gt('expires_at', nowIso)
-    .limit(1);
-
-  if (activeLarge && activeLarge.length > 0) {
-    const expDate = new Date(activeLarge[0].expires_at);
-    const diffMs = Math.max(0, expDate - new Date());
-    const hoursLeft = Math.floor(diffMs / (1000 * 60 * 60));
-    const minsLeft = Math.ceil((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-    return {
-      locked: true,
-      fileName: activeLarge[0].attachment_name,
-      expiresAt: activeLarge[0].expires_at,
-      message: `50 MB üzerinde aktif bir dosyanız (${activeLarge[0].attachment_name}) zaten var! Silinmesine kalan süre: ${hoursLeft} saat ${minsLeft} dk.`
-    };
+// MESAJLARI OKUNDU İŞARETLE
+app.post('/chat/mark-read', async (req, res) => {
+  const { readerId, senderId } = req.body;
+  if (!readerId || !senderId) return res.json({ success: false });
+  try {
+    await supabase
+      .from('messages')
+      .update({ is_read: true })
+      .eq('receiver_id', readerId)
+      .eq('sender_id', senderId)
+      .eq('is_read', false);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false });
   }
-  return { locked: false };
-}
+});
+
+// GRUP OLUŞTURMA
+app.post('/chat/groups/create', async (req, res) => {
+  const { name, creatorId, memberIds } = req.body;
+  if (!name || !creatorId) return res.status(400).json({ error: 'Grup adı gerekli.' });
+
+  const cleanName = name.trim().slice(0, 35);
+  const avatarUrl = `https://api.dicebear.com/9.x/shapes/svg?seed=${encodeURIComponent(cleanName)}&backgroundColor=72c7ff`;
+
+  try {
+    const { data: group, error: gErr } = await supabase
+      .from('chat_groups')
+      .insert([{ name: cleanName, avatar_url: avatarUrl, created_by: creatorId }])
+      .select()
+      .single();
+    if (gErr) throw gErr;
+
+    const allMembers = Array.from(new Set([creatorId, ...(Array.isArray(memberIds) ? memberIds : [])]));
+    const memberRows = allMembers.map(uid => ({ group_id: group.id, user_id: uid }));
+    await supabase.from('chat_group_members').insert(memberRows);
+
+    res.json({ success: true, group });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// KULLANICININ GRUPLARINI GETİR
+app.get('/chat/groups/:userId', async (req, res) => {
+  const { userId } = req.params;
+  if (!userId) return res.json([]);
+  try {
+    const { data: memberships } = await supabase
+      .from('chat_group_members')
+      .select('group_id')
+      .eq('user_id', userId);
+
+    if (!memberships || memberships.length === 0) return res.json([]);
+    const groupIds = memberships.map(m => m.group_id);
+
+    const { data: groups } = await supabase
+      .from('chat_groups')
+      .select('*')
+      .in('id', groupIds);
+
+    const { data: allMembers } = await supabase
+      .from('chat_group_members')
+      .select('group_id, user_id')
+      .in('group_id', groupIds);
+
+    const { data: recentGroupMsgs } = await supabase
+      .from('messages')
+      .select('group_id, created_at')
+      .in('group_id', groupIds)
+      .order('created_at', { ascending: false });
+
+    const lastGroupMsgMap = {};
+    if (recentGroupMsgs) {
+      for (const gm of recentGroupMsgs) {
+        if (gm.group_id && !lastGroupMsgMap[gm.group_id]) {
+          lastGroupMsgMap[gm.group_id] = gm.created_at;
+        }
+      }
+    }
+
+    const result = (groups || []).map(g => {
+      const mCount = (allMembers || []).filter(m => m.group_id === g.id).length;
+      return {
+        ...g,
+        member_count: mCount,
+        last_message_at: lastGroupMsgMap[g.id] || g.created_at
+      };
+    });
+
+    result.sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
+    res.json(result);
+  } catch (err) {
+    res.json([]);
+  }
+});
 
 // 1. İki kullanıcı arasındaki mesajları getir
 app.get('/chat/messages', async (req, res) => {
   const { user1, user2 } = req.query;
   if (!user1 || !user2) return res.status(400).json({ error: 'Eksik bilgi.' });
 
-  await cleanupExpiredLargeFiles();
-
   const { data, error } = await supabase
     .from('messages')
     .select('*')
+    .is('group_id', null)
     .or(`and(sender_id.eq.${user1},receiver_id.eq.${user2}),and(sender_id.eq.${user2},receiver_id.eq.${user1})`)
     .order('created_at', { ascending: true });
 
@@ -569,81 +548,67 @@ app.get('/chat/messages', async (req, res) => {
   res.json(data || []);
 });
 
-// 2. Doğrudan R2'ye (1 GB'a kadar) dosya yüklemek için Presigned URL al
-app.post('/chat/presign-upload', async (req, res) => {
-  const { senderId, fileName, fileSize, contentType } = req.body;
-  if (!senderId || !fileName || !fileSize) return res.status(400).json({ error: 'Eksik dosya bilgisi.' });
-
-  const sizeNum = Number(fileSize);
-  if (sizeNum > MAX_CHAT_FILE_BYTES) {
-    return res.status(400).json({ error: 'Tek seferde gönderilebilecek maksimum dosya boyutu 1 GB olabilir!' });
-  }
-
-  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
-  if (isLargeFile) {
-    const lockStatus = await checkActiveLargeFileLock(senderId);
-    if (lockStatus.locked) {
-      return res.status(400).json({ error: lockStatus.message });
-    }
-  }
-
-  const fileKey = `chat/${senderId}/${Date.now()}-${cleanFileName(fileName)}`;
-  const uploadUrl = createR2PresignedPutUrl(fileKey, contentType || 'application/octet-stream', 3600);
-  const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
-  const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
-
-  res.json({
-    uploadUrl,
-    publicUrl,
-    fileKey,
-    isLargeFile,
-    expiresAt
-  });
-});
-
-// 3. Sunucu üzerinden dosya yükleme (50 MB altı dosyalar veya CORS yedeği için)
-app.post('/chat/upload-direct', upload.single('file'), async (req, res) => {
-  const { senderId } = req.body;
-  if (!senderId || !req.file) return res.status(400).json({ error: 'Dosya bulunamadı.' });
-
-  const sizeNum = req.file.size;
-  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
-  if (isLargeFile) {
-    const lockStatus = await checkActiveLargeFileLock(senderId);
-    if (lockStatus.locked) {
-      return res.status(400).json({ error: lockStatus.message });
-    }
-  }
+// 2. Grup mesajlarını getir (Gönderen isimleriyle birlikte)
+app.get('/chat/group-messages', async (req, res) => {
+  const { groupId } = req.query;
+  if (!groupId) return res.status(400).json({ error: 'Grup ID gerekli.' });
 
   try {
-    const fileKey = `chat/${senderId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
+    const { data: msgs, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('group_id', groupId)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const senderIds = Array.from(new Set((msgs || []).map(m => m.sender_id)));
+    let nameMap = {};
+    if (senderIds.length > 0) {
+      const { data: profs } = await supabase.from('profiles').select('user_id, display_name').in('user_id', senderIds);
+      (profs || []).forEach(p => { nameMap[p.user_id] = p.display_name; });
+    }
+
+    const enriched = (msgs || []).map(m => ({
+      ...m,
+      sender_name: nameMap[m.sender_id] || 'Üye'
+    }));
+    res.json(enriched);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Sesli mesaj yükleme (Mikrofondan kaydedilen ses)
+app.post('/chat/upload-voice', voiceUpload.single('voice'), async (req, res) => {
+  const { senderId } = req.body;
+  if (!senderId || !req.file) return res.status(400).json({ error: 'Ses kaydı bulunamadı.' });
+
+  try {
+    const fileKey = `chat_voice/${senderId}/${Date.now()}-sesli_mesaj.webm`;
     await s3.send(new PutObjectCommand({
       Bucket: process.env.R2_BUCKET_NAME,
       Key: fileKey,
       Body: req.file.buffer,
-      ContentType: req.file.mimetype || 'application/octet-stream'
+      ContentType: req.file.mimetype || 'audio/webm'
     }));
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
-    const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
-
     res.json({
       publicUrl,
       fileKey,
-      fileName: req.file.originalname,
-      fileSize: sizeNum,
-      isLargeFile,
-      expiresAt
+      fileName: 'Sesli Mesaj',
+      fileSize: req.file.size
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 4. Sohbete mesaj / medya kaydı gönder
+// 4. Sohbete veya Gruba mesaj / GIF / Sesli Mesaj gönder
 app.post('/chat/send', async (req, res) => {
   const {
     senderId,
     receiverId,
+    groupId,
     content,
     attachmentUrl,
     attachmentKey,
@@ -652,39 +617,28 @@ app.post('/chat/send', async (req, res) => {
     attachmentSize
   } = req.body;
 
-  if (!senderId || !receiverId) return res.status(400).json({ error: 'Gönderici veya alıcı eksik.' });
-
-  const sizeNum = Number(attachmentSize) || 0;
-  if (sizeNum > MAX_CHAT_FILE_BYTES) {
-    return res.status(400).json({ error: 'Maksimum dosya boyutu 1 GB olabilir!' });
+  if (!senderId || (!receiverId && !groupId)) {
+    return res.status(400).json({ error: 'Gönderici veya alıcı/grup eksik.' });
   }
-
-  const isLargeFile = sizeNum > LARGE_FILE_THRESHOLD;
-  if (isLargeFile) {
-    const lockStatus = await checkActiveLargeFileLock(senderId);
-    if (lockStatus.locked) {
-      return res.status(400).json({ error: lockStatus.message });
-    }
-  }
-
-  const expiresAt = isLargeFile ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
 
   try {
     const { data, error } = await supabase
       .from('messages')
       .insert([{
         sender_id: senderId,
-        receiver_id: receiverId,
+        receiver_id: groupId ? null : receiverId,
+        group_id: groupId ? Number(groupId) : null,
         content: content || '',
         attachment_url: attachmentUrl || null,
         attachment_key: attachmentKey || null,
         attachment_name: attachmentName || null,
         attachment_type: attachmentType || null,
-        attachment_size: sizeNum,
-        is_large_file: isLargeFile,
-        expires_at: expiresAt,
+        attachment_size: Number(attachmentSize) || 0,
+        is_large_file: false,
+        expires_at: null,
         is_expired_deleted: false,
-        is_pinned: false
+        is_pinned: false,
+        is_read: false
       }])
       .select()
       .single();
