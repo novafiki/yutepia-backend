@@ -16,32 +16,55 @@ const voiceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize
 const MAX_USER_QUOTA_BYTES = 50 * 1024 * 1024;
 const MAX_CHAT_BG_BYTES = 10 * 1024 * 1024; // 10 MB
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  auth: { persistSession: false }
+});
+
 const s3 = new S3Client({
   region: 'auto',
   endpoint: process.env.R2_ENDPOINT,
   credentials: { accessKeyId: process.env.R2_ACCESS_KEY, secretAccessKey: process.env.R2_SECRET_KEY }
 });
 
+// HIZLANDIRICI BELLEK (RAM) ÖNBELLEKLERİ
+const knownProfileUsers = new Set(); // /ping sırasında gereksiz SELECT sorgusunu önler
+const gifSearchCache = new Map(); // { query: { gifs: [...], expires: timestamp } }
+let onlineUsersCache = { data: null, expires: 0 };
+
 function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
+
+async function fetchWithTimeout(url, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
 
 // MÜZİKLERİ GETİR
 app.get('/songs', async (req, res) => {
-  const { userId } = req.query; if (!userId) return res.status(400).json({ error: 'Gerekli.' });
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Gerekli.' });
   const { data, error } = await supabase
     .from('songs')
-    .select('*')
+    .select('id, user_id, title, url, file_key, file_size, sort_order')
     .eq('user_id', userId)
     .order('sort_order', { ascending: true })
     .order('id', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
-  const totalBytes = data.reduce((acc, item) => acc + (Number(item.file_size) || 0), 0);
-  res.json({ songs: data, totalBytes, maxBytes: MAX_USER_QUOTA_BYTES });
+  const totalBytes = (data || []).reduce((acc, item) => acc + (Number(item.file_size) || 0), 0);
+  res.json({ songs: data || [], totalBytes, maxBytes: MAX_USER_QUOTA_BYTES });
 });
 
 // MÜZİK YÜKLE
 app.post('/upload', upload.single('music'), async (req, res) => {
-  const userId = req.body.userId; if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
+  const userId = req.body.userId;
+  if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
   try {
     const { data: existingSongs } = await supabase.from('songs').select('file_size, sort_order').eq('user_id', userId);
     const usedBytes = (existingSongs || []).reduce((acc, s) => acc + (Number(s.file_size) || 0), 0);
@@ -82,34 +105,46 @@ app.post('/songs/reorder', async (req, res) => {
 
 // MÜZİK SİL
 app.delete('/songs/:id', async (req, res) => {
-  const { id } = req.params; const { userId } = req.query; if (!userId) return res.status(401).json({ error: 'Yetkisiz' });
+  const { id } = req.params;
+  const { userId } = req.query;
+  if (!userId) return res.status(401).json({ error: 'Yetkisiz' });
   try {
-    const { data: song } = await supabase.from('songs').select('*').eq('id', id).eq('user_id', userId).single();
+    const { data: song } = await supabase.from('songs').select('id, file_key').eq('id', id).eq('user_id', userId).single();
     if (!song) return res.status(404).json({ error: 'Bulunamadı' });
-    if (song.file_key) await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: song.file_key }));
-    await supabase.from('songs').delete().eq('id', id).eq('user_id', userId);
+    await Promise.all([
+      song.file_key ? s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: song.file_key })).catch(() => {}) : Promise.resolve(),
+      supabase.from('songs').delete().eq('id', id).eq('user_id', userId)
+    ]);
     res.json({ message: 'Silindi' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// KULLANICI PROFİL VE TEMA AYARLARI
+// KULLANICI PROFİL VE TEMA AYARLARI (Paralel Sorgu ile 2x Hızlı)
 app.get('/profile-settings', async (req, res) => {
-  const { userId } = req.query; if (!userId) return res.json({});
-  const { data } = await supabase.from('user_backgrounds').select('*').eq('user_id', userId).maybeSingle();
-  const { data: prof } = await supabase.from('profiles').select('*').eq('user_id', userId).maybeSingle();
-  res.json({
-    displayName: prof?.display_name || null,
-    profileId: prof?.id || null,
-    bio: prof?.bio || '',
-    bgUrl: data?.bg_url || null,
-    chatBgUrl: data?.chat_bg_url || null,
-    avatarUrl: data?.avatar_url || null,
-    panelColor: data?.panel_color || '#73c8fa',
-    panelOpacity: data?.panel_opacity !== null && data?.panel_opacity !== undefined ? Number(data.panel_opacity) : 0.48,
-    bgOpacity: data?.bg_opacity !== null && data?.bg_opacity !== undefined ? Number(data.bg_opacity) : 1.0,
-    bgBlur: data?.bg_blur !== null && data?.bg_blur !== undefined ? Number(data.bg_blur) : 0,
-    autoPlay: data?.auto_play === true
-  });
+  const { userId } = req.query;
+  if (!userId) return res.json({});
+  try {
+    const [{ data }, { data: prof }] = await Promise.all([
+      supabase.from('user_backgrounds').select('*').eq('user_id', userId).maybeSingle(),
+      supabase.from('profiles').select('id, display_name, bio').eq('user_id', userId).maybeSingle()
+    ]);
+    if (prof) knownProfileUsers.add(userId);
+    res.json({
+      displayName: prof?.display_name || null,
+      profileId: prof?.id || null,
+      bio: prof?.bio || '',
+      bgUrl: data?.bg_url || null,
+      chatBgUrl: data?.chat_bg_url || null,
+      avatarUrl: data?.avatar_url || null,
+      panelColor: data?.panel_color || '#73c8fa',
+      panelOpacity: data?.panel_opacity !== null && data?.panel_opacity !== undefined ? Number(data.panel_opacity) : 0.48,
+      bgOpacity: data?.bg_opacity !== null && data?.bg_opacity !== undefined ? Number(data.bg_opacity) : 1.0,
+      bgBlur: data?.bg_blur !== null && data?.bg_blur !== undefined ? Number(data.bg_blur) : 0,
+      autoPlay: data?.auto_play === true
+    });
+  } catch (err) {
+    res.json({});
+  }
 });
 
 // HAKKINDA (BIO) GÜNCELLEME
@@ -156,6 +191,7 @@ app.post('/username', async (req, res) => {
       .eq('user_id', userId);
 
     if (error) throw error;
+    onlineUsersCache.expires = 0;
     res.json({ success: true, displayName: cleanName });
   } catch (err) {
     res.status(500).json({ error: 'Kullanıcı adı güncellenemedi: ' + err.message });
@@ -163,12 +199,15 @@ app.post('/username', async (req, res) => {
 });
 
 app.post('/background', upload.single('background'), async (req, res) => {
-  const userId = req.body.userId; if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
+  const userId = req.body.userId;
+  if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
   try {
     const { data: oldData } = await supabase.from('user_backgrounds').select('file_key').eq('user_id', userId).maybeSingle();
-    if (oldData && oldData.file_key) await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.file_key })).catch(() => {});
     const fileKey = `backgrounds/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
-    await s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileKey, Body: req.file.buffer, ContentType: req.file.mimetype }));
+    await Promise.all([
+      oldData && oldData.file_key ? s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.file_key })).catch(() => {}) : Promise.resolve(),
+      s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: fileKey, Body: req.file.buffer, ContentType: req.file.mimetype }))
+    ]);
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
     await supabase.from('user_backgrounds').upsert({ user_id: userId, bg_url: publicUrl, file_key: fileKey }, { onConflict: 'user_id' });
     res.json({ bgUrl: publicUrl });
@@ -176,14 +215,18 @@ app.post('/background', upload.single('background'), async (req, res) => {
 });
 
 app.post('/avatar', upload.single('avatar'), async (req, res) => {
-  const userId = req.body.userId; if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
+  const userId = req.body.userId;
+  if (!userId || !req.file) return res.status(400).json({ error: 'Hata' });
   try {
     const { data: oldData } = await supabase.from('user_backgrounds').select('avatar_key').eq('user_id', userId).maybeSingle();
-    if (oldData && oldData.avatar_key) await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.avatar_key })).catch(() => {});
     const avatarKey = `avatars/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
-    await s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: avatarKey, Body: req.file.buffer, ContentType: req.file.mimetype }));
+    await Promise.all([
+      oldData && oldData.avatar_key ? s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.avatar_key })).catch(() => {}) : Promise.resolve(),
+      s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: avatarKey, Body: req.file.buffer, ContentType: req.file.mimetype }))
+    ]);
     const publicUrl = `${process.env.R2_PUBLIC_URL}/${avatarKey}`;
     await supabase.from('user_backgrounds').upsert({ user_id: userId, avatar_url: publicUrl, avatar_key: avatarKey }, { onConflict: 'user_id' });
+    onlineUsersCache.expires = 0;
     res.json({ avatarUrl: publicUrl });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -212,7 +255,8 @@ app.post('/theme', async (req, res) => {
 
 // KULLANICININ KENDİ PROFİL ID'SİNİ GETİR
 app.get('/my-profile-id', async (req, res) => {
-  const { userId } = req.query; if (!userId) return res.status(400).json({ error: 'Gerekli' });
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Gerekli' });
   let { data } = await supabase.from('profiles').select('id, display_name').eq('user_id', userId).maybeSingle();
   if (!data) {
     const { data: inserted } = await supabase
@@ -223,10 +267,11 @@ app.get('/my-profile-id', async (req, res) => {
     data = inserted;
   }
   if (!data) return res.status(404).json({ error: 'Bulunamadı' });
+  knownProfileUsers.add(userId);
   res.json({ profileId: data.id, displayName: data.display_name });
 });
 
-// ZİYARET EDİLEN PROFİL VERİLERİ
+// ZİYARET EDİLEN PROFİL VERİLERİ (5 Sıralı Sorgu Yerine Tek Paralel Batch!)
 app.get('/user-profile/:id', async (req, res) => {
   const shortId = req.params.id;
   const viewerId = req.query.viewerId;
@@ -234,30 +279,38 @@ app.get('/user-profile/:id', async (req, res) => {
   const { data: profile } = await supabase.from('profiles').select('*').eq('id', shortId).maybeSingle();
   if (!profile) return res.status(404).json({ error: 'Bulunamadı' });
   const realUserId = profile.user_id;
-  const { data: settings } = await supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle();
-  const { data: songs } = await supabase
-    .from('songs')
-    .select('id, title, url, file_size, sort_order')
-    .eq('user_id', realUserId)
-    .order('sort_order', { ascending: true })
-    .order('id', { ascending: true });
 
-  let friendshipStatus = 'none';
-  let viewerAutoPlay = false;
+  const queries = [
+    supabase.from('user_backgrounds').select('*').eq('user_id', realUserId).maybeSingle(),
+    supabase
+      .from('songs')
+      .select('id, title, url, file_size, sort_order')
+      .eq('user_id', realUserId)
+      .order('sort_order', { ascending: true })
+      .order('id', { ascending: true })
+  ];
 
   if (viewerId) {
-    const { data: viewerSettings } = await supabase.from('user_backgrounds').select('auto_play').eq('user_id', viewerId).maybeSingle();
-    viewerAutoPlay = viewerSettings?.auto_play === true;
-
+    queries.push(supabase.from('user_backgrounds').select('auto_play').eq('user_id', viewerId).maybeSingle());
     if (viewerId !== realUserId) {
-      const { data: f1 } = await supabase.from('friendships').select('status').eq('sender_id', viewerId).eq('receiver_id', realUserId).maybeSingle();
-      const { data: f2 } = await supabase.from('friendships').select('status').eq('sender_id', realUserId).eq('receiver_id', viewerId).maybeSingle();
-      const rel = f1 || f2;
-      if (rel && rel.status) {
-        friendshipStatus = rel.status;
-      }
+      queries.push(
+        supabase
+          .from('friendships')
+          .select('status')
+          .or(`and(sender_id.eq.${viewerId},receiver_id.eq.${realUserId}),and(sender_id.eq.${realUserId},receiver_id.eq.${viewerId})`)
+          .maybeSingle()
+      );
     }
   }
+
+  const results = await Promise.all(queries);
+  const settings = results[0]?.data || null;
+  const songs = results[1]?.data || [];
+  const viewerSettings = viewerId ? results[2]?.data : null;
+  const rel = (viewerId && viewerId !== realUserId) ? results[3]?.data : null;
+
+  const viewerAutoPlay = viewerSettings?.auto_play === true;
+  const friendshipStatus = (rel && rel.status) ? rel.status : 'none';
 
   res.json({
     realUserId,
@@ -267,13 +320,13 @@ app.get('/user-profile/:id', async (req, res) => {
     friendshipStatus,
     viewerAutoPlay,
     ownerAutoPlay: settings?.auto_play === true,
-    avatarUrl: settings?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${profile.display_name || 'Anon'}&backgroundColor=72c7ff`,
+    avatarUrl: settings?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${encodeURIComponent(profile.display_name || 'Anon')}&backgroundColor=72c7ff`,
     bgUrl: settings?.bg_url || '/arkaplan.jpg',
     panelColor: settings?.panel_color || '#73c8fa',
     panelOpacity: settings?.panel_opacity !== null && settings?.panel_opacity !== undefined ? Number(settings.panel_opacity) : 0.48,
     bgOpacity: settings?.bg_opacity !== null && settings?.bg_opacity !== undefined ? Number(settings.bg_opacity) : 1.0,
     bgBlur: settings?.bg_blur !== null && settings?.bg_blur !== undefined ? Number(settings.bg_blur) : 0,
-    songs: songs || []
+    songs
   });
 });
 
@@ -281,172 +334,227 @@ app.get('/user-profile/:id', async (req, res) => {
 // ARKADAŞLIK VE AKTİFLİK SİSTEMİ
 // ==========================================
 app.post('/ping', async (req, res) => {
-    const { userId, defaultName } = req.body;
-    if(!userId) return res.json({success:false});
+  const { userId, defaultName } = req.body;
+  if (!userId) return res.json({ success: false });
 
-    const { data: existingProf } = await supabase.from('profiles').select('id, display_name').eq('user_id', userId).maybeSingle();
-    if (!existingProf) {
-        await supabase.from('profiles').insert([{
-            user_id: userId,
-            display_name: defaultName || 'Üye',
-            last_seen: new Date().toISOString()
-        }]);
-    } else {
-        const updateObj = { last_seen: new Date().toISOString() };
-        if (!existingProf.display_name && defaultName) {
-            updateObj.display_name = defaultName;
-        }
-        await supabase.from('profiles').update(updateObj).eq('user_id', userId);
+  const nowIso = new Date().toISOString();
+
+  // Kullanıcı zaten biliniyorsa doğrudan tek UPDATE sorgusu çalıştır
+  if (knownProfileUsers.has(userId)) {
+    await supabase.from('profiles').update({ last_seen: nowIso }).eq('user_id', userId);
+    return res.json({ success: true });
+  }
+
+  const { data: existingProf } = await supabase.from('profiles').select('id, display_name').eq('user_id', userId).maybeSingle();
+  if (!existingProf) {
+    await supabase.from('profiles').insert([{
+      user_id: userId,
+      display_name: defaultName || 'Üye',
+      last_seen: nowIso
+    }]);
+  } else {
+    const updateObj = { last_seen: nowIso };
+    if (!existingProf.display_name && defaultName) {
+      updateObj.display_name = defaultName;
     }
-    res.json({success:true});
+    await supabase.from('profiles').update(updateObj).eq('user_id', userId);
+  }
+  knownProfileUsers.add(userId);
+  res.json({ success: true });
 });
 
 app.post('/logout', async (req, res) => {
-    const { userId } = req.body; if(!userId) return res.json({success:false});
-    const pastDate = new Date(Date.now() - 10 * 60000).toISOString();
-    await supabase.from('profiles').update({ last_seen: pastDate }).eq('user_id', userId);
-    res.json({success:true});
+  const { userId } = req.body;
+  if (!userId) return res.json({ success: false });
+  const pastDate = new Date(Date.now() - 10 * 60000).toISOString();
+  await supabase.from('profiles').update({ last_seen: pastDate }).eq('user_id', userId);
+  onlineUsersCache.expires = 0;
+  res.json({ success: true });
 });
 
 app.get('/online-users', async (req, res) => {
-    const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
-    const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id').gte('last_seen', twoMinsAgo);
-    if(!profiles || profiles.length === 0) return res.json([]);
-    const userIds = profiles.map(p => p.user_id);
-    const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', userIds);
-    const result = profiles.map(p => { const bg = bgs?.find(b => b.user_id === p.user_id); return { ...p, avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${p.display_name}&backgroundColor=72c7ff` }; });
-    res.json(result);
+  if (onlineUsersCache.data && Date.now() < onlineUsersCache.expires) {
+    return res.json(onlineUsersCache.data);
+  }
+  const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
+  const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id').gte('last_seen', twoMinsAgo).limit(80);
+  if (!profiles || profiles.length === 0) {
+    onlineUsersCache = { data: [], expires: Date.now() + 8000 };
+    return res.json([]);
+  }
+  const userIds = profiles.map(p => p.user_id);
+  const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', userIds);
+  const bgMap = {};
+  (bgs || []).forEach(b => { bgMap[b.user_id] = b.avatar_url; });
+
+  const result = profiles.map(p => ({
+    ...p,
+    avatar_url: bgMap[p.user_id] || `https://api.dicebear.com/9.x/lorelei/svg?seed=${encodeURIComponent(p.display_name || 'Uye')}&backgroundColor=72c7ff`
+  }));
+  onlineUsersCache = { data: result, expires: Date.now() + 8000 };
+  res.json(result);
 });
 
 app.post('/friends/request', async (req, res) => {
-    const { senderId, receiverId } = req.body;
-    if(!senderId || !receiverId) return res.status(400).json({error: 'Eksik bilgi.'});
-    if(senderId === receiverId) return res.status(400).json({error: 'Kendinize istek gönderemezsiniz.'});
-    
-    const { data: ex1 } = await supabase.from('friendships').select('id, status').eq('sender_id', senderId).eq('receiver_id', receiverId);
-    const { data: ex2 } = await supabase.from('friendships').select('id, status').eq('sender_id', receiverId).eq('receiver_id', senderId);
-    const record = (ex1 && ex1.length > 0) ? ex1[0] : ((ex2 && ex2.length > 0) ? ex2[0] : null);
-    
-    if (record) {
-        if (record.status === 'pending') return res.status(400).json({error: 'Zaten bekleyen bir istek var.'});
-        if (record.status === 'accepted') return res.status(400).json({error: 'Zaten arkadaşsınız.'});
-        if (record.status === 'rejected') await supabase.from('friendships').delete().eq('id', record.id);
-    }
-    
-    const { error } = await supabase.from('friendships').insert({ sender_id: senderId, receiver_id: receiverId, status: 'pending' });
-    if (error) return res.status(500).json({error: `DB Hatası: ${error.message}`});
-    res.json({success: true});
+  const { senderId, receiverId } = req.body;
+  if (!senderId || !receiverId) return res.status(400).json({ error: 'Eksik bilgi.' });
+  if (senderId === receiverId) return res.status(400).json({ error: 'Kendinize istek gönderemezsiniz.' });
+
+  const { data: existing } = await supabase
+    .from('friendships')
+    .select('id, status')
+    .or(`and(sender_id.eq.${senderId},receiver_id.eq.${receiverId}),and(sender_id.eq.${receiverId},receiver_id.eq.${senderId})`);
+
+  const record = existing && existing.length > 0 ? existing[0] : null;
+
+  if (record) {
+    if (record.status === 'pending') return res.status(400).json({ error: 'Zaten bekleyen bir istek var.' });
+    if (record.status === 'accepted') return res.status(400).json({ error: 'Zaten arkadaşsınız.' });
+    if (record.status === 'rejected') await supabase.from('friendships').delete().eq('id', record.id);
+  }
+
+  const { error } = await supabase.from('friendships').insert({ sender_id: senderId, receiver_id: receiverId, status: 'pending' });
+  if (error) return res.status(500).json({ error: `DB Hatası: ${error.message}` });
+  res.json({ success: true });
 });
 
 app.post('/friends/remove', async (req, res) => {
-    const { userId, friendId } = req.body;
-    if (!userId || !friendId) return res.status(400).json({ error: 'Eksik bilgi.' });
-    try {
-        await supabase.from('friendships').delete().eq('sender_id', userId).eq('receiver_id', friendId);
-        await supabase.from('friendships').delete().eq('sender_id', friendId).eq('receiver_id', userId);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+  const { userId, friendId } = req.body;
+  if (!userId || !friendId) return res.status(400).json({ error: 'Eksik bilgi.' });
+  try {
+    await Promise.all([
+      supabase.from('friendships').delete().eq('sender_id', userId).eq('receiver_id', friendId),
+      supabase.from('friendships').delete().eq('sender_id', friendId).eq('receiver_id', userId)
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/friends/requests/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const { data, error } = await supabase.from('friendships').select('id, sender_id').eq('receiver_id', userId).eq('status', 'pending');
-    if(error || !data || data.length === 0) return res.json([]);
-    
-    const senderIds = data.map(d => d.sender_id);
-    const { data: profiles } = await supabase.from('profiles').select('user_id, display_name').in('user_id', senderIds);
-    const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', senderIds);
-    
-    const result = data.map(req => {
-        const prof = profiles?.find(p => p.user_id === req.sender_id);
-        const bg = bgs?.find(b => b.user_id === req.sender_id);
-        return { 
-            id: req.id, sender_id: req.sender_id, display_name: prof?.display_name || 'Gizemli Üye', 
-            avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff` 
-        };
-    });
-    res.json(result);
+  const { userId } = req.params;
+  const { data, error } = await supabase.from('friendships').select('id, sender_id').eq('receiver_id', userId).eq('status', 'pending');
+  if (error || !data || data.length === 0) return res.json([]);
+
+  const senderIds = data.map(d => d.sender_id);
+  const [{ data: profiles }, { data: bgs }] = await Promise.all([
+    supabase.from('profiles').select('user_id, display_name').in('user_id', senderIds),
+    supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', senderIds)
+  ]);
+
+  const profMap = {};
+  (profiles || []).forEach(p => { profMap[p.user_id] = p.display_name; });
+  const bgMap = {};
+  (bgs || []).forEach(b => { bgMap[b.user_id] = b.avatar_url; });
+
+  const result = data.map(reqItem => ({
+    id: reqItem.id,
+    sender_id: reqItem.sender_id,
+    display_name: profMap[reqItem.sender_id] || 'Gizemli Üye',
+    avatar_url: bgMap[reqItem.sender_id] || `https://api.dicebear.com/9.x/lorelei/svg?seed=Anon&backgroundColor=72c7ff`
+  }));
+  res.json(result);
 });
 
 app.post('/friends/respond', async (req, res) => {
-    const { requestId, status } = req.body; 
-    if (status === 'rejected') {
-        const { error } = await supabase.from('friendships').delete().eq('id', requestId);
-        if(error) return res.status(500).json({error: error.message});
-    } else {
-        const { error } = await supabase.from('friendships').update({status}).eq('id', requestId);
-        if(error) return res.status(500).json({error: error.message});
-    }
-    res.json({success: true});
+  const { requestId, status } = req.body;
+  if (status === 'rejected') {
+    const { error } = await supabase.from('friendships').delete().eq('id', requestId);
+    if (error) return res.status(500).json({ error: error.message });
+  } else {
+    const { error } = await supabase.from('friendships').update({ status }).eq('id', requestId);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+  res.json({ success: true });
 });
 
-// ARKADAŞ LİSTESİ (Son mesajlaşma zamanı ve okunmamış mesaj sayısıyla birlikte)
+// ARKADAŞ LİSTESİ (Paralel Sorgu + Sütun Optimizasyonu ile Çok Hızlı)
 app.get('/friends/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const { data } = await supabase.from('friendships').select('*').eq('status', 'accepted').or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
-    if(!data || data.length === 0) return res.json([]);
-    const friendIds = data.map(d => d.sender_id === userId ? d.receiver_id : d.sender_id);
-    const { data: profiles } = await supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds);
-    const { data: bgs } = await supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds);
-    
-    const { data: recentMsgs } = await supabase
-      .from('messages')
-      .select('*')
-      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
-      .order('created_at', { ascending: false });
+  const { userId } = req.params;
+  const { data } = await supabase
+    .from('friendships')
+    .select('sender_id, receiver_id')
+    .eq('status', 'accepted')
+    .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
 
-    const lastMsgMap = {};
-    const unreadFromMap = {};
-    if (recentMsgs) {
-      for (const m of recentMsgs) {
-        if (m.group_id) continue;
-        const otherId = m.sender_id === userId ? m.receiver_id : m.sender_id;
-        if (otherId && !lastMsgMap[otherId]) {
-          lastMsgMap[otherId] = m.created_at;
-        }
-        if (m.receiver_id === userId && m.is_read === false) {
-          unreadFromMap[m.sender_id] = (unreadFromMap[m.sender_id] || 0) + 1;
-        }
+  if (!data || data.length === 0) return res.json([]);
+  const friendIds = data.map(d => d.sender_id === userId ? d.receiver_id : d.sender_id);
+
+  const [{ data: profiles }, { data: bgs }, { data: recentMsgs }] = await Promise.all([
+    supabase.from('profiles').select('user_id, display_name, id, last_seen').in('user_id', friendIds),
+    supabase.from('user_backgrounds').select('user_id, avatar_url').in('user_id', friendIds),
+    supabase
+      .from('messages')
+      .select('sender_id, receiver_id, group_id, created_at, is_read')
+      .is('group_id', null)
+      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
+      .order('created_at', { ascending: false })
+      .limit(400)
+  ]);
+
+  const lastMsgMap = {};
+  const unreadFromMap = {};
+  if (recentMsgs) {
+    for (const m of recentMsgs) {
+      if (m.group_id) continue;
+      const otherId = m.sender_id === userId ? m.receiver_id : m.sender_id;
+      if (otherId && !lastMsgMap[otherId]) {
+        lastMsgMap[otherId] = m.created_at;
+      }
+      if (m.receiver_id === userId && m.is_read === false) {
+        unreadFromMap[m.sender_id] = (unreadFromMap[m.sender_id] || 0) + 1;
       }
     }
+  }
 
-    const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
-    
-    const result = friendIds.map(fid => {
-        const prof = profiles?.find(p => p.user_id === fid);
-        const bg = bgs?.find(b => b.user_id === fid);
-        if(!prof) return null;
-        return {
-          user_id: fid,
-          profile_id: prof.id,
-          display_name: prof.display_name || 'Üye',
-          avatar_url: bg?.avatar_url || `https://api.dicebear.com/9.x/lorelei/svg?seed=${prof.display_name}&backgroundColor=72c7ff`,
-          is_online: prof.last_seen > twoMinsAgo,
-          last_message_at: lastMsgMap[fid] || null,
-          unread_count: unreadFromMap[fid] || 0
-        };
-    }).filter(Boolean);
-    res.json(result);
+  const profMap = {};
+  (profiles || []).forEach(p => { profMap[p.user_id] = p; });
+  const bgMap = {};
+  (bgs || []).forEach(b => { bgMap[b.user_id] = b.avatar_url; });
+
+  const twoMinsAgo = new Date(Date.now() - 2 * 60000).toISOString();
+
+  const result = friendIds.map(fid => {
+    const prof = profMap[fid];
+    if (!prof) return null;
+    return {
+      user_id: fid,
+      profile_id: prof.id,
+      display_name: prof.display_name || 'Üye',
+      avatar_url: bgMap[fid] || `https://api.dicebear.com/9.x/lorelei/svg?seed=${encodeURIComponent(prof.display_name || 'Uye')}&backgroundColor=72c7ff`,
+      is_online: prof.last_seen > twoMinsAgo,
+      last_message_at: lastMsgMap[fid] || null,
+      unread_count: unreadFromMap[fid] || 0
+    };
+  }).filter(Boolean);
+
+  res.json(result);
 });
 
 // ==========================================
 // SOHBET (CHAT), GIF, SESLİ MESAJ VE GRUP SİSTEMİ
 // ==========================================
 
-// HIZLI GIF ARAMA SERVİSİ (Önce Tenor, sonra Giphy yedekli)
+// HIZLI GIF ARAMA SERVİSİ (Önbellekli + Zaman Aşımlı)
 app.get('/chat/gifs', async (req, res) => {
-  const q = (req.query.q || '').trim();
+  const q = (req.query.q || '').trim().toLowerCase();
+  const cacheKey = q || '__trending__';
+  const cached = gifSearchCache.get(cacheKey);
+  if (cached && Date.now() < cached.expires) {
+    return res.json({ gifs: cached.gifs });
+  }
+
   try {
     const tenorEndpoint = q
       ? `https://g.tenor.com/v1/search?q=${encodeURIComponent(q)}&key=LIVDSRZULELA&limit=24`
       : `https://g.tenor.com/v1/trending?key=LIVDSRZULELA&limit=24`;
-    const tRes = await fetch(tenorEndpoint);
+    const tRes = await fetchWithTimeout(tenorEndpoint, 2200);
     if (tRes.ok) {
       const tJson = await tRes.json();
       const tUrls = (tJson.results || []).map(item => item.media?.[0]?.tinygif?.url || item.media?.[0]?.gif?.url).filter(Boolean);
       if (tUrls.length > 0) {
+        gifSearchCache.set(cacheKey, { gifs: tUrls, expires: Date.now() + 5 * 60000 });
         return res.json({ gifs: tUrls });
       }
     }
@@ -457,7 +565,7 @@ app.get('/chat/gifs', async (req, res) => {
     const endpoint = q
       ? `https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(q)}&limit=24&rating=pg-13`
       : `https://api.giphy.com/v1/gifs/trending?api_key=${giphyKey}&limit=24&rating=pg-13`;
-    const response = await fetch(endpoint);
+    const response = await fetchWithTimeout(endpoint, 2200);
     if (response.ok) {
       const json = await response.json();
       const urls = (json.data || []).map(item =>
@@ -465,6 +573,9 @@ app.get('/chat/gifs', async (req, res) => {
         item.images?.fixed_height?.url ||
         item.images?.original?.url
       ).filter(Boolean);
+      if (urls.length > 0) {
+        gifSearchCache.set(cacheKey, { gifs: urls, expires: Date.now() + 5 * 60000 });
+      }
       return res.json({ gifs: urls });
     }
   } catch (err) {}
@@ -531,7 +642,7 @@ app.post('/chat/groups/create', async (req, res) => {
   }
 });
 
-// KULLANICININ GRUPLARINI GETİR
+// KULLANICININ GRUPLARINI GETİR (Paralel Sorgu ile 3x Hızlı)
 app.get('/chat/groups/:userId', async (req, res) => {
   const { userId } = req.params;
   if (!userId) return res.json([]);
@@ -544,21 +655,16 @@ app.get('/chat/groups/:userId', async (req, res) => {
     if (!memberships || memberships.length === 0) return res.json([]);
     const groupIds = memberships.map(m => m.group_id);
 
-    const { data: groups } = await supabase
-      .from('chat_groups')
-      .select('*')
-      .in('id', groupIds);
-
-    const { data: allMembers } = await supabase
-      .from('chat_group_members')
-      .select('group_id, user_id')
-      .in('group_id', groupIds);
-
-    const { data: recentGroupMsgs } = await supabase
-      .from('messages')
-      .select('group_id, created_at')
-      .in('group_id', groupIds)
-      .order('created_at', { ascending: false });
+    const [{ data: groups }, { data: allMembers }, { data: recentGroupMsgs }] = await Promise.all([
+      supabase.from('chat_groups').select('*').in('id', groupIds),
+      supabase.from('chat_group_members').select('group_id, user_id').in('group_id', groupIds),
+      supabase
+        .from('messages')
+        .select('group_id, created_at')
+        .in('group_id', groupIds)
+        .order('created_at', { ascending: false })
+        .limit(200)
+    ]);
 
     const lastGroupMsgMap = {};
     if (recentGroupMsgs) {
@@ -569,14 +675,16 @@ app.get('/chat/groups/:userId', async (req, res) => {
       }
     }
 
-    const result = (groups || []).map(g => {
-      const mCount = (allMembers || []).filter(m => m.group_id === g.id).length;
-      return {
-        ...g,
-        member_count: mCount,
-        last_message_at: lastGroupMsgMap[g.id] || g.created_at
-      };
+    const memberCountMap = {};
+    (allMembers || []).forEach(m => {
+      memberCountMap[m.group_id] = (memberCountMap[m.group_id] || 0) + 1;
     });
+
+    const result = (groups || []).map(g => ({
+      ...g,
+      member_count: memberCountMap[g.id] || 1,
+      last_message_at: lastGroupMsgMap[g.id] || g.created_at
+    }));
 
     result.sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
     res.json(result);
@@ -593,11 +701,13 @@ app.get('/chat/messages', async (req, res) => {
   const { data, error } = await supabase
     .from('messages')
     .select('*')
+    .is('group_id', null)
     .or(`and(sender_id.eq.${user1},receiver_id.eq.${user2}),and(sender_id.eq.${user2},receiver_id.eq.${user1})`)
-    .order('created_at', { ascending: true });
+    .order('created_at', { ascending: true })
+    .limit(250);
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json((data || []).filter(m => !m.group_id));
+  res.json(data || []);
 });
 
 // 2. Grup mesajlarını getir
@@ -610,7 +720,8 @@ app.get('/chat/group-messages', async (req, res) => {
       .from('messages')
       .select('*')
       .eq('group_id', groupId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .limit(250);
     if (error) throw error;
 
     const senderIds = Array.from(new Set((msgs || []).map(m => m.sender_id)));
@@ -742,17 +853,18 @@ app.post('/chat/background', (req, res) => {
 
     try {
       const { data: oldData } = await supabase.from('user_backgrounds').select('chat_bg_key').eq('user_id', userId).maybeSingle();
-      if (oldData && oldData.chat_bg_key) {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {});
-      }
-
       const fileKey = `chat_backgrounds/${userId}/${Date.now()}-${cleanFileName(req.file.originalname)}`;
-      await s3.send(new PutObjectCommand({
-        Bucket: process.env.R2_BUCKET_NAME,
-        Key: fileKey,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype
-      }));
+
+      await Promise.all([
+        oldData && oldData.chat_bg_key ? s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {}) : Promise.resolve(),
+        s3.send(new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: fileKey,
+          Body: req.file.buffer,
+          ContentType: req.file.mimetype
+        }))
+      ]);
+
       const publicUrl = `${process.env.R2_PUBLIC_URL}/${fileKey}`;
 
       await supabase.from('user_backgrounds').upsert({
@@ -774,10 +886,10 @@ app.post('/chat/background/reset', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'Yetkisiz' });
   try {
     const { data: oldData } = await supabase.from('user_backgrounds').select('chat_bg_key').eq('user_id', userId).maybeSingle();
-    if (oldData && oldData.chat_bg_key) {
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {});
-    }
-    await supabase.from('user_backgrounds').update({ chat_bg_url: null, chat_bg_key: null }).eq('user_id', userId);
+    await Promise.all([
+      oldData && oldData.chat_bg_key ? s3.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: oldData.chat_bg_key })).catch(() => {}) : Promise.resolve(),
+      supabase.from('user_backgrounds').update({ chat_bg_url: null, chat_bg_key: null }).eq('user_id', userId)
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
