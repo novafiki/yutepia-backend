@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
@@ -28,12 +30,12 @@ const s3 = new S3Client({
 
 const knownProfileUsers = new Set();
 const gifSearchCache = new Map();
-const groupLastReadCache = new Map(); // key: `${userId}_${groupId}` -> ISO Date
+const groupLastReadCache = new Map();
 let onlineUsersCache = { data: null, expires: 0 };
 
 function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -45,6 +47,13 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
     throw err;
   }
 }
+
+// ALT MODÜLLERİN KULLANABİLMESİ İÇİN ORTAK BAĞLANTILARI PAYLAŞ
+app.locals.supabase = supabase;
+app.locals.s3 = s3;
+app.locals.upload = upload;
+app.locals.fetchWithTimeout = fetchWithTimeout;
+app.locals.cleanFileName = cleanFileName;
 
 // ================= MÜZİK VE KOTA =================
 app.get('/songs', async (req, res) => {
@@ -425,7 +434,7 @@ app.get('/friends/:userId', async (req, res) => {
   res.json(result);
 });
 
-// ================= ÇOK KATMANLI KESİN ÇALIŞAN GIF MOTORU =================
+// ================= ÇOK KATMANLI GIF MOTORU =================
 app.get('/chat/gifs', async (req, res) => {
   const q = (req.query.q || '').trim().toLowerCase();
   const cacheKey = q || '__trending__';
@@ -441,7 +450,6 @@ app.get('/chat/gifs', async (req, res) => {
     }
   };
 
-  // KATMAN 1: Tenor API v1
   try {
     const tenorApiUrl = q
       ? `https://g.tenor.com/v1/search?q=${encodeURIComponent(q)}&key=LIVDSRZULELA&limit=28&media_filter=minimal`
@@ -453,14 +461,11 @@ app.get('/chat/gifs', async (req, res) => {
       const tJson = await tRes.json();
       (tJson.results || []).forEach(item => {
         const media = item.media && item.media[0];
-        if (media) {
-          addUniqueUrl(media.tinygif?.url || media.gif?.url || media.nanogif?.url);
-        }
+        if (media) addUniqueUrl(media.tinygif?.url || media.gif?.url || media.nanogif?.url);
       });
     }
   } catch (e) {}
 
-  // KATMAN 2: Doğrudan Tenor Web Arama Sayfası Çözümleyici (API Anahtarı Gerektirmez, %100 Çalışır)
   if (collectedUrls.length < 6) {
     try {
       const searchSlug = q ? encodeURIComponent(q.replace(/\s+/g, '-')) : 'anime-happy';
@@ -468,8 +473,7 @@ app.get('/chat/gifs', async (req, res) => {
       const webRes = await fetchWithTimeout(tenorWebUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml',
-          'Accept-Language': 'en-US,en;q=0.9,tr;q=0.8'
+          'Accept': 'text/html,application/xhtml+xml'
         }
       }, 3500);
       if (webRes.ok) {
@@ -480,7 +484,6 @@ app.get('/chat/gifs', async (req, res) => {
     } catch (e) {}
   }
 
-  // KATMAN 3: Giphy API (Eğer geçerli bir GIPHY_API_KEY tanımlıysa)
   if (collectedUrls.length < 6 && process.env.GIPHY_API_KEY && process.env.GIPHY_API_KEY !== 'dc6zaTOxFJmzC') {
     try {
       const giphyKey = process.env.GIPHY_API_KEY;
@@ -493,21 +496,6 @@ app.get('/chat/gifs', async (req, res) => {
         (gJson.data || []).forEach(item => {
           addUniqueUrl(item.images?.fixed_height_small?.url || item.images?.fixed_height?.url || item.images?.original?.url);
         });
-      }
-    } catch (e) {}
-  }
-
-  // KATMAN 4: Giphy Web Sayfası Çözümleyici (Yedek)
-  if (collectedUrls.length < 6) {
-    try {
-      const gWebUrl = q ? `https://giphy.com/search/${encodeURIComponent(q)}` : `https://giphy.com/trending-gifs`;
-      const gWebRes = await fetchWithTimeout(gWebUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-      }, 3200);
-      if (gWebRes.ok) {
-        const gHtml = await gWebRes.text();
-        const gMatches = gHtml.match(/https:\/\/media[0-9]?\.giphy\.com\/media\/[a-zA-Z0-9]+\/giphy\.gif/g) || [];
-        gMatches.forEach(url => addUniqueUrl(url));
       }
     } catch (e) {}
   }
@@ -549,7 +537,6 @@ app.post('/chat/groups/create', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GRUP OKUNDU İŞARETLE (Hem RAM önbelleğine hem DB'ye yazar)
 app.post('/chat/groups/mark-read', async (req, res) => {
   const { userId, groupId } = req.body;
   if (!userId || !groupId) return res.json({ success: false });
@@ -561,7 +548,6 @@ app.post('/chat/groups/mark-read', async (req, res) => {
   res.json({ success: true });
 });
 
-// KULLANICININ GRUPLARINI GETİR (Kendi mesajlarını asla okunmamış saymaz!)
 app.get('/chat/groups/:userId', async (req, res) => {
   const { userId } = req.params;
   if (!userId) return res.json([]);
@@ -589,10 +575,7 @@ app.get('/chat/groups/:userId', async (req, res) => {
     if (recentGroupMsgs) {
       for (const gm of recentGroupMsgs) {
         if (!gm.group_id) continue;
-        if (!lastGroupMsgMap[gm.group_id]) {
-          lastGroupMsgMap[gm.group_id] = gm.created_at;
-        }
-        // SADECE BAŞKASININ ATTIĞI VE SON OKUMA TARİHİNDEN YENİ OLAN MESAJLARI SAY
+        if (!lastGroupMsgMap[gm.group_id]) lastGroupMsgMap[gm.group_id] = gm.created_at;
         if (gm.sender_id !== userId && new Date(gm.created_at) > new Date(lastReadMap[gm.group_id])) {
           unreadCountMap[gm.group_id] = (unreadCountMap[gm.group_id] || 0) + 1;
         }
@@ -685,7 +668,6 @@ app.post('/chat/groups/:groupId/leave', async (req, res) => {
 
   const { data: remaining } = await supabase.from('chat_group_members').select('user_id').eq('group_id', groupId).order('joined_at', { ascending: true });
 
-  // GRUPTA HİÇ KULLANICI KALMADIYSA GRUBU VE SUNUCUDAKİ TÜM MEDYALARINI SİL
   if (!remaining || remaining.length === 0) {
     const { data: grpMsgs } = await supabase.from('messages').select('attachment_key').eq('group_id', groupId);
     const deletePromises = [];
@@ -710,7 +692,6 @@ app.post('/chat/groups/:groupId/leave', async (req, res) => {
   res.json({ success: true, deleted: false });
 });
 
-// ================= MESAJLAŞMA UÇ NOKTALARI =================
 app.get('/chat/messages', async (req, res) => {
   const { user1, user2 } = req.query;
   if (!user1 || !user2) return res.status(400).json({ error: 'Eksik bilgi.' });
@@ -770,7 +751,6 @@ app.post('/chat/send', async (req, res) => {
     const { data, error } = await supabase.from('messages').insert([insertPayload]).select().single();
     if (error) throw error;
 
-    // Gönderen kişinin kendi mesajı için bildirim almaması adına son okuma zamanını güncelle
     if (groupId) {
       const readIso = data?.created_at || new Date().toISOString();
       groupLastReadCache.set(`${senderId}_${groupId}`, readIso);
@@ -823,6 +803,38 @@ app.post('/chat/background/reset', async (req, res) => {
     ]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ================= DİNAMİK MODÜL VE EVREN YÜKLEYİCİ =================
+// Yeni ekleyeceğimiz tüm kategori/katalog dosyalarını otomatik algılar ve bağlar
+const externalModules = [
+  { file: './catalog.js', route: '/catalog' },
+  { file: './routes/catalog.js', route: '/catalog' },
+  { file: './routes/anime.js', route: '/anime' },
+  { file: './routes/manga.js', route: '/manga' },
+  { file: './routes/oyun.js', route: '/oyun' },
+  { file: './routes/film.js', route: '/film' },
+  { file: './routes/dizi.js', route: '/dizi' }
+];
+
+externalModules.forEach(mod => {
+  const fullPath = path.join(__dirname, mod.file);
+  if (fs.existsSync(fullPath)) {
+    try {
+      const loadedModule = require(fullPath);
+      if (typeof loadedModule === 'function') {
+        // Eğer modül (app) => {} fonksiyonuysa veya Express Router ise bağla
+        if (loadedModule.name === 'router' || loadedModule.stack) {
+          app.use(mod.route, loadedModule);
+        } else {
+          loadedModule(app);
+        }
+        console.log(`Modül yüklendi: ${mod.file}`);
+      }
+    } catch (err) {
+      console.error(`Modül yükleme hatası (${mod.file}):`, err.message);
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3000;
