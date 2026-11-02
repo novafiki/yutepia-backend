@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
@@ -35,7 +33,7 @@ let onlineUsersCache = { data: null, expires: 0 };
 
 function cleanFileName(name) { return (name || 'dosya').replace(/[^a-zA-Z0-9._-]/g, '_'); }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -47,13 +45,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
     throw err;
   }
 }
-
-// ALT MODÜLLERİN KULLANABİLMESİ İÇİN ORTAK BAĞLANTILARI PAYLAŞ
-app.locals.supabase = supabase;
-app.locals.s3 = s3;
-app.locals.upload = upload;
-app.locals.fetchWithTimeout = fetchWithTimeout;
-app.locals.cleanFileName = cleanFileName;
 
 // ================= MÜZİK VE KOTA =================
 app.get('/songs', async (req, res) => {
@@ -507,7 +498,7 @@ app.get('/chat/gifs', async (req, res) => {
   res.json({ gifs: finalGifs });
 });
 
-// ================= SOHBET VE GRUP BİLDİRİM SİSTEMİ =================
+// ================= SOHBET VE GRUP SİSTEMİ =================
 app.post('/chat/mark-read', async (req, res) => {
   const { readerId, senderId } = req.body;
   if (!readerId || !senderId) return res.json({ success: false });
@@ -803,38 +794,6 @@ app.post('/chat/background/reset', async (req, res) => {
     ]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ================= DİNAMİK MODÜL VE EVREN YÜKLEYİCİ =================
-// Yeni ekleyeceğimiz tüm kategori/katalog dosyalarını otomatik algılar ve bağlar
-const externalModules = [
-  { file: './catalog.js', route: '/catalog' },
-  { file: './routes/catalog.js', route: '/catalog' },
-  { file: './routes/anime.js', route: '/anime' },
-  { file: './routes/manga.js', route: '/manga' },
-  { file: './routes/oyun.js', route: '/oyun' },
-  { file: './routes/film.js', route: '/film' },
-  { file: './routes/dizi.js', route: '/dizi' }
-];
-
-externalModules.forEach(mod => {
-  const fullPath = path.join(__dirname, mod.file);
-  if (fs.existsSync(fullPath)) {
-    try {
-      const loadedModule = require(fullPath);
-      if (typeof loadedModule === 'function') {
-        // Eğer modül (app) => {} fonksiyonuysa veya Express Router ise bağla
-        if (loadedModule.name === 'router' || loadedModule.stack) {
-          app.use(mod.route, loadedModule);
-        } else {
-          loadedModule(app);
-        }
-        console.log(`Modül yüklendi: ${mod.file}`);
-      }
-    } catch (err) {
-      console.error(`Modül yükleme hatası (${mod.file}):`, err.message);
-    }
-  }
 });
 
 const PORT = process.env.PORT || 3000;
