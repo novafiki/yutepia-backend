@@ -796,5 +796,8 @@ app.post('/chat/background/reset', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Katalog ve Çoklu Kaynak Veri Çekme Modülünü Bağla
+require('./catalog.js')(app, supabase, fetchWithTimeout);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor.`));
